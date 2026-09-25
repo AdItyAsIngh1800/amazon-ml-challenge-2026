@@ -144,3 +144,15 @@ def test_write_source_tsv_rejects_tab_in_field(tmp_path: Path) -> None:
                        "business_address": [""], "country": ["US"]})
     with pytest.raises(ValueError, match="business_name"):
         io_utils.write_source_tsv(df, tmp_path / "s.tsv")
+
+
+def test_read_ground_truth_pairs(tmp_path: Path) -> None:
+    """One row per true pair; a singleton S1 keeps one row with cand_id ''."""
+    f = _write(
+        tmp_path / "gt.tsv",
+        "source1_entity_id\tmatched_entity_ids\nS1-1\tS2-1,S3-9\nS1-2\t\nS1-3\tS3-4\n",
+    )
+    df = io_utils.read_ground_truth_pairs(f)
+    assert list(df.columns) == ["s1_id", "cand_id"]
+    assert df.values.tolist() == [["S1-1", "S2-1"], ["S1-1", "S3-9"], ["S1-2", ""], ["S1-3", "S3-4"]]
+    assert all(pd.api.types.is_string_dtype(df[c]) for c in df.columns)
