@@ -1,0 +1,30 @@
+"""Data contracts: the columns each stage artifact must contain (see CLAUDE.md).
+
+Stages validate their inputs against these with ``io_utils.require_columns``.
+Changing a contract needs the lead's approval.
+"""
+
+from __future__ import annotations
+
+# records_{split}.parquet — one row per S1/S2/S3 record.
+RECORDS_COLUMNS: tuple[str, ...] = (
+    "entity_id", "source", "country", "name_raw", "addr_raw",
+    "name_norm", "name_core", "legal_suffix", "name_acronym", "addr_norm",
+    "postal_tokens", "num_tokens", "landmark_flag", "name_empty", "addr_empty",
+)
+
+# candidates_{split}.parquet — one row per (S1, S2/S3 candidate) pair.
+CANDIDATES_COLUMNS: tuple[str, ...] = (
+    "s1_id", "cand_id", "cand_source", "country_match",
+    "pass_A_score", "pass_A_rank", "pass_B_score", "pass_B_rank",
+    "pass_C_score", "pass_C_rank", "pass_F_score", "pass_F_rank",
+    "n_passes", "best_block_score", "rev_n_s1", "rev_rank", "rev_gap",
+)
+
+# features_{split}/part-*.parquet — key columns; feature columns are float32,
+# plus "label" on the train split.
+FEATURES_KEY_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id")
+
+OOF_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id", "fold", "prob", "label")
+PRED_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id", "prob")
+DECISION_CONFIG_KEYS: tuple[str, ...] = ("t", "t_empty", "one_owner")

@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from src import config
+from src import blocking, config, decide, features, model, normalize
 from src.config import Paths
 from src.logging_utils import setup_logging, track_stage
 
@@ -55,39 +55,28 @@ class Stage:
     run: Callable[[Paths, str], None]
 
 
-def _not_implemented(name: str, owner: str) -> Callable[[Paths, str], None]:
-    """Placeholder run function that names the owning module."""
-
-    def _run(paths: Paths, split: str) -> None:
-        """Raise NotImplementedError for this stage."""
-        raise NotImplementedError(f"Stage '{name}' ({split}) is not implemented yet; owner: {owner}")
-
-    return _run
-
-
-def _stage(name: str, owner: str, splits: tuple[str, ...], outputs: Callable[[Paths, str], list[Path]]) -> Stage:
-    """Build a Stage whose run function is still a placeholder."""
-    return Stage(name, owner, splits, outputs, _not_implemented(name, owner))
-
-
 BOTH = ("train", "test")
+# Stage wiring only. Implementations live in each owner's module as
+# run_stage(paths, split); teammates never edit this file. model.py and
+# decide.py own two stages each and branch on the split.
 STAGES: dict[str, Stage] = {
     s.name: s
     for s in (
-        _stage("prep", "normalize.py (Member 2)", BOTH,
-               lambda p, sp: [p.artifacts_dir / f"records_{sp}.parquet"]),
-        _stage("block", "blocking.py (Member 3)", BOTH,
-               lambda p, sp: [p.artifacts_dir / f"candidates_{sp}.parquet"]),
-        _stage("feat", "features.py (Member 4)", BOTH,
-               lambda p, sp: [p.artifacts_dir / f"features_{sp}"]),
-        _stage("train", "model.py (Member 4)", ("train",),
-               lambda p, sp: [p.artifacts_dir / "oof_train.parquet"]),
-        _stage("predict", "model.py (Member 4)", ("test",),
-               lambda p, sp: [p.artifacts_dir / "pred_test.parquet"]),
-        _stage("decide", "decide.py (Member 1)", ("train",),
-               lambda p, sp: [p.artifacts_dir / "decision_config.json"]),
-        _stage("write", "run_pipeline.py + io_utils.py (Member 1)", ("test",),
-               lambda p, sp: [p.output_dir / "matching_results.tsv", p.output_dir / "candidate_pairs.tsv"]),
+        Stage("prep", normalize.OWNER, BOTH,
+              lambda p, sp: [p.artifacts_dir / f"records_{sp}.parquet"], normalize.run_stage),
+        Stage("block", blocking.OWNER, BOTH,
+              lambda p, sp: [p.artifacts_dir / f"candidates_{sp}.parquet"], blocking.run_stage),
+        Stage("feat", features.OWNER, BOTH,
+              lambda p, sp: [p.artifacts_dir / f"features_{sp}"], features.run_stage),
+        Stage("train", model.OWNER, ("train",),
+              lambda p, sp: [p.artifacts_dir / "oof_train.parquet"], model.run_stage),
+        Stage("predict", model.OWNER, ("test",),
+              lambda p, sp: [p.artifacts_dir / "pred_test.parquet"], model.run_stage),
+        Stage("decide", decide.OWNER, ("train",),
+              lambda p, sp: [p.artifacts_dir / "decision_config.json"], decide.run_stage),
+        Stage("write", decide.OWNER, ("test",),
+              lambda p, sp: [p.output_dir / "matching_results.tsv", p.output_dir / "candidate_pairs.tsv"],
+              decide.run_stage),
     )
 }
 
