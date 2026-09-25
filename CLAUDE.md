@@ -41,7 +41,7 @@ code/business_entity_resolution/
         blocking.py features.py model.py decide.py evaluate.py
         logging_utils.py run_pipeline.py tests/
   README.md  requirements.txt  pyproject.toml
-notebooks/   artifacts/ (gitignored)   output/ (TSVs gitignored)
+artifacts/ (gitignored)   output/ (TSVs gitignored)
 ```
 
 ## TSV reading — ONLY via `io_utils.read_source`
@@ -79,7 +79,7 @@ Each stage skips if its output exists unless --force. Logs runtime + peak RAM.
 - Postal-like tokens = every standalone 5-6 digit number, all countries.
 - UTF-8 on every open, "\n" on write. pathlib for all paths.
 - multiprocessing only under `if __name__ == "__main__":`.
-- Whole pipeline < 12 GB RAM. Chunk anything that scales with pairs.
+- Target peak RAM 10 GB (hard limit 12 GB). Chunk anything that scales with pairs.
   Never build a full similarity matrix. float32. Integer IDs internally.
 - Fixed seeds (config.SEED = 42), deterministic LightGBM, fixed num_threads.
 - Models: MIT or Apache 2.0, <= 8B params; record name/license/params.
@@ -116,7 +116,7 @@ Tests first (TDD) for evaluate.py and io_utils.py.
 
 ## Workflow
 - Dev sample first (`artifacts/dev_sample/`, via --data-dir), then full data
-  on Colab. Dev-sample scores overstate precision; thresholds come only from
+  on the Mac (Member 1). Dev-sample scores overstate precision; thresholds come only from
   full data.
 - Every change reports metric impact: pair recall, % S1 fully covered, avg
   cands/S1, F0.5 overall/singleton/non-singleton/per country, LOCO.

@@ -1,6 +1,6 @@
 # Business Entity Resolution — Amazon ML Challenge 2026
 
-Python 3.13 (tested on 3.13.13 macOS and 3.13.15 on Colab).
+Python 3.13 (tested on 3.13.13 macOS).
 
 ## Overview
 

@@ -102,15 +102,14 @@ D11 TF-IDF vocabularies and IDF weights are fitted per split on that
 - Country is an open set of labels. France records go through every
   stage. No filtering, hard-coding or one-hot of countries.
 - [Mentor 6] Everything reproduces from src/ via one command. CLAUDE.md
-  and the Colab notebook may stay in the repo but are not needed to
-  reproduce.
+  may stay in the repo but is not needed to reproduce.
 
 =====================================================================
 4. TEAM ROLES, BACKUPS AND SHIFTS
 =====================================================================
 Member 1 — Lead / Integration (Aditya)
   Repo, contracts, io_utils, scorer, dev sample, runner, decision
-  layer, Colab/Kaggle full runs, leaderboard submissions, README,
+  layer, full-data runs on the Mac, leaderboard submissions, README,
   final zip. Backup: Member 4.
 Member 2 — Data and Normalisation
   EDA, normalize.py, dictionaries (incl. French), LOCO experiments,
@@ -127,7 +126,7 @@ Pair A = Members 1 + 2 | Pair B = Members 3 + 4
 Sat 02:00-05:30  Pair A works. Pair B sleeps.
 Sat 05:30-10:30  Pair A sleeps. Pair B starts at 08:00.
 Sat 10:30-Sun 00:00  Everyone.
-Sun 00:00-05:00  Pair B sleeps. Pair A starts the full Colab run.
+Sun 00:00-05:00  Pair B sleeps. Pair A starts the full run on the Mac.
 Sun 04:30-09:30  Pair A sleeps. Pair B monitors and starts error
                  analysis.
 Sun 09:30-23:59  Everyone.
@@ -135,13 +134,22 @@ Sun 09:30-23:59  Everyone.
 =====================================================================
 5. COMPUTE AND ENVIRONMENT
 =====================================================================
-Machines
-- Laptops (MacBook Air, Windows): development on the dev sample only.
-- Google Colab: the canonical machine for all full-data runs.
-- Kaggle notebook (about 30 GB RAM): backup for memory-heavy runs.
-  Data uploaded as a PRIVATE Kaggle dataset only.
-- Colab Pro High-RAM is optional, not required.
+COMPUTE (revised — Mac only, no Colab)
+- Member 1's MacBook Air is the only machine for full-data runs,
+  validation numbers and final outputs.
+- Teammates develop and test on the dev sample on their own laptops.
+  Full-data runs are queued to Member 1 after merging to main.
+  Official numbers come only from the Mac.
+- Mac full runs: plugged in, caffeinate -i, heavy apps closed,
+  Memory Pressure watched in Activity Monitor (yellow = reduce chunk
+  size). Pipeline target peak RAM: 10 GB.
+- Backups: after each milestone, copy artifacts/ and output/ to an
+  external disk.
+- M5 reproduction test: a teammate follows only the README on their own
+  machine (Windows laptop preferred), in a fresh clone and fresh venv.
+  Backup option: Docker Linux container.
 
+  
 Memory design (target: whole pipeline under 12 GB)
 - Process one country group at a time (plus the fallback pass if
   needed).
@@ -154,28 +162,15 @@ Memory design (target: whole pipeline under 12 GB)
   stages.
 - If memory runs out: smaller chunks first, then smaller K.
 
-Colab reliability
-- Every stage writes to Google Drive and is skipped if its output
-  already exists (--force to rerun).
-- The notebook only mounts Drive, clones the repo, installs
-  requirements and calls run_pipeline.py. No logic in the notebook.
-- Runtime and peak RAM logged per stage.
 
 Cross-platform rules
-- Same Python version as Colab for everyone (check `python --version`
-  on Colab, pin it in the README).
+- Python 3.13 for everyone (requires-python >=3.13,<3.14, pinned in
+  the README).
 - pathlib for all paths. No shell-only commands in Python.
 - multiprocessing only under if __name__ == "__main__".
 - Mac: brew install libomp before installing LightGBM.
 - encoding="utf-8" on every open. "\n" line endings on write.
 
-Dev sample (built by Member 1 in Phase 0)
-- Fixed seed. About 10% of train S1, stratified by country x singleton
-  flag, all their true matches, plus random other S2/S3 records as
-  distractors.
-- Debugging only. The sample has fewer distractors than real data, so
-  it overstates precision. Scores and thresholds come only from full
-  data.
 
 =====================================================================
 6. REPOSITORY, CONTRACTS AND CONVENTIONS
@@ -198,7 +193,6 @@ Layout
     README.md
     requirements.txt     exact pinned versions
   CLAUDE.md              (repo only, not needed to reproduce)
-  notebooks/colab_run.ipynb  (repo only)
 
 TSV reading (all code goes through io_utils.read_source)
   sep="\t", dtype=str, keep_default_na=False, na_filter=False,
@@ -347,7 +341,7 @@ PHASE 0 — FOUNDATION (Sat 02:00-05:30, Pair A)
 ---------------------------------------------------------------------
 MEMBER 1
  1. Private GitHub repo, layout from Section 6, protected main.
- 2. Check Colab's Python version, pin it. Start requirements.txt.
+ 2. Pin Python 3.13. Start requirements.txt.
  3. Write CLAUDE.md (Section 18).
  4. io_utils.py: read_source(), write_id_list_tsv(), parquet helpers.
  5. evaluate.py: scorer + unit tests (0.714 example + all edge cases),
@@ -383,7 +377,7 @@ MEMBER 3 (from 08:00) — Blocking v0
  - Temporary minimal normalisation until normalize.py lands.
  - Pass A (plus Pass F if E5 needs it). Chunked top-K, float32.
  - candidates.parquet per contract.
- - Recall at K = 5, 10, 20, 50 on full train (Colab). Runtime and RAM.
+ - Recall at K = 5, 10, 20, 50 on full train (Mac). Runtime and RAM.
  PASS: recall report exists, runs under 12 GB on full train.
 
 MEMBER 4 (from 08:00) — Features v0 + rule baseline
@@ -400,7 +394,6 @@ MEMBER 2 (from 10:30) — normalize.py v1
 MEMBER 1 (from 10:30) — Runner + decision v0 + first submission
  - run_pipeline.py with stage skipping and --force.
  - decide.py v0: global t + t_empty, grid search on full train.
- - Colab notebook.
  - Test run -> both TSVs -> validator PASS -> upload.
  PASS for M1: SCORED status, validation score logged.
 
@@ -432,7 +425,7 @@ MEMBER 2 — Normalisation v2 + LOCO + docs
  - Draft documentation sections 2.1 and 3 with real numbers.
 
 M2 PASS: global OOF macro F0.5 reported, validator PASS, submitted.
-Before Pair B sleeps: full v2 test run started on Colab.
+Before Pair B sleeps: full v2 test run started on the Mac.
 
 ---------------------------------------------------------------------
 PHASE 3 — ERROR ANALYSIS (Sun 05:00-13:00) -> M3
@@ -452,9 +445,9 @@ PHASE 3 — ERROR ANALYSIS (Sun 05:00-13:00) -> M3
 PHASE 4 — FREEZE (Sun 13:00-18:00) -> M4
 ---------------------------------------------------------------------
  - Merge everything to main. Remove dead code.
- - Full run on a fresh Colab runtime from main: train -> test ->
+ - Full run from a fresh clone of main on the Mac: train -> test ->
    outputs. Save the trained models.
- - Validator with --check-ids (Kaggle if Colab runs out of memory).
+ - Validator with --check-ids.
  - Final leaderboard upload.
  - 18:00 CODE FREEZE, tag v-final.
 
@@ -462,7 +455,8 @@ PHASE 4 — FREEZE (Sun 13:00-18:00) -> M4
 PHASE 5 — REPRODUCE AND SUBMIT (Sun 18:00-22:00) -> M5, M6
 ---------------------------------------------------------------------
  18:00-21:00
- - Member 3: fresh clone, fresh Colab runtime, follow ONLY the README.
+ - Member 3: fresh clone, fresh venv on their own
+   machine (Windows preferred), follow ONLY the README.
    Outputs must match the frozen files (row counts + checksum). If not,
    fix determinism first.
  - Members 2 + 4: finish documentation (Section 16).
@@ -500,8 +494,8 @@ Improvement priorities (in order)
  P3 Expected-F0.5 subset selection per S1.
  P4 Seed averaging (3 seeds) of LightGBM.
  P5 Pass D embeddings, only if B3 misses are mainly transliteration or
-    word reordering. License check first. Colab GPU, float16
-    embeddings saved to Drive.
+    word reordering. License check first. float16 embeddings
+    saved to artifacts/.
  P6 Cross-encoder re-ranker for borderline pairs (default: skip).
 
 =====================================================================
@@ -529,8 +523,10 @@ documentation, zip structure check.
 =====================================================================
 14. RISK REGISTER
 =====================================================================
-R1 Colab out of memory -> chunking, smaller K, Kaggle 30 GB backup.
-R2 Colab disconnects -> stage checkpoints on Drive, resumable runner.
+R1 Mac out of memory -> smaller chunks, then smaller K; watch Memory
+   Pressure.
+R2 Run crashes or Mac sleeps -> stage outputs in artifacts/ are
+   skipped on rerun (resumable runner), caffeinate -i.
 R3 Test denser than train (more distractors) -> reverse features,
    one-owner rule, compare train vs test score distributions.
 R4 France distribution shift -> country-agnostic features, LOCO,
@@ -598,7 +594,7 @@ Zip structure
   │       └── requirements.txt
   └── Documentation_template.md
 [ ] Fresh-clone run reproduced both files.
-[ ] README works without CLAUDE.md or the notebook.
+[ ] README works without CLAUDE.md.
 [ ] No external API calls anywhere in src/.
 [ ] All models listed with MIT/Apache 2.0 licenses.
 [ ] Zip unzipped and checked before submitting.
@@ -616,7 +612,7 @@ Zip structure
   seeds.
 - Allowed libraries with licenses. New dependencies need lead
   approval.
-- Workflow: dev sample first, then full data on Colab. Every change
+- Workflow: dev sample first, then full data on the Mac (Member 1). Every change
   reports its metric impact.
 
 =====================================================================
