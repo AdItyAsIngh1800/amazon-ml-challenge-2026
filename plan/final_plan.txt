@@ -1,0 +1,682 @@
+=====================================================================
+AMAZON ML CHALLENGE 2026 — BUSINESS ENTITY RESOLUTION
+FINAL PLAN AND TEAM GUIDE
+Deadline: Sun 27 Sept, 23:59 IST | Code freeze: Sun 18:00 IST
+Plan start: Sat 26 Sept, 02:00 IST
+=====================================================================
+
+CONTENTS
+ 1. Problem and scoring
+ 2. Key design decisions
+ 3. Rules, fair play and licensing
+ 4. Team roles, backups and shifts
+ 5. Compute and environment
+ 6. Repository, contracts and conventions
+ 7. Solution architecture
+ 8. Validation protocol
+ 9. Timeline and milestones
+10. Phase-by-phase tasks
+11. Error analysis loop and improvement priorities
+12. Cut list
+13. Leaderboard policy
+14. Risk register
+15. Communication protocol
+16. Documentation plan
+17. Final submission checklist
+18. CLAUDE.md contents
+19. Claude Code starter prompts
+
+=====================================================================
+1. PROBLEM AND SCORING
+=====================================================================
+Task: for every Source 1 (S1) record, output all Source 2 (S2) and
+Source 3 (S3) records that describe the same real-world business.
+S1 is deduplicated. An S1 entity can match zero, one or many records.
+
+Data: TSV files, columns entity_id, business_name, business_address,
+country. Train covers US and India. Test adds France, which never
+appears in training. The full test set is about 1.7M records.
+
+Metric: F0.5 per S1 entity, then macro-averaged over ALL S1 entities.
+  - truth empty, prediction empty          -> 1.0
+  - truth empty, prediction non-empty      -> 0.0
+  - truth non-empty, prediction empty      -> 0.0
+  - otherwise F0.5 = 1.25PR / (0.25P + R)
+Precision counts twice as much as recall. Singletons are worth a full
+point each when we correctly predict an empty list.
+
+Outputs (both tab-separated, UTF-8):
+  matching_results.tsv   source1_entity_id | matched_entity_ids
+  candidate_pairs.tsv    source1_entity_id | candidate_entity_ids
+One row per test S1. Empty lists allowed. S2-/S3- IDs only. No
+duplicates. Matches must be a subset of candidates. candidate_pairs
+is the exact set the model scores, not an early blocking pass.
+
+=====================================================================
+2. KEY DESIGN DECISIONS
+=====================================================================
+D1  Blocking sets the recall ceiling. We measure blocking recall on
+    full training data before building on top of it.
+D2  We optimise the per-S1 decision directly (which subset, or none),
+    not pairwise accuracy.
+D3  A dedicated "empty list" gate captures singleton points.
+D4  One-owner rule: since S1 is deduplicated, each S2/S3 record should
+    belong to at most one S1. Verified in EDA (E3). If it holds, each
+    S2/S3 record goes only to its best-scoring S1.
+D5  Group context features (rank among an S1's candidates, gap to the
+    best, reverse rank of the S1 among all S1s for that record) carry
+    most of the signal in entity resolution.
+D6  France is unseen. All features are country-agnostic similarity
+    scores, ratios and flags. No country identity feature anywhere.
+    Generalisation is tested with leave-one-country-out (LOCO).
+D7  [Mentor 1] Global validation. OOF predictions for ALL train S1,
+    then one-owner rule and threshold tuning on the whole training set
+    at once, so every record competes with all its real rivals.
+    Reverse features use blocking scores over all S1, never labels.
+D8  [Mentor 2] Country-only blocking is used only if EDA (E5) shows
+    true pairs share a country label about 100% of the time.
+    Otherwise a cross-country fallback pass is added.
+D9  [Mentor 3] Postal-like tokens = every standalone 5-6 digit number
+    in any address, for every country. No `if country == ...`.
+D10 [Mentor 4] French rules come from token frequencies in unlabeled
+    test France records (provided data). Small dictionary, documented
+    as domain rules. No hand-labelling of test records.
+D11 TF-IDF vocabularies and IDF weights are fitted per split on that
+    split's own S1+S2+S3 records (provided data, unsupervised).
+    Documented as transductive preprocessing.
+
+=====================================================================
+3. RULES, FAIR PLAY AND LICENSING
+=====================================================================
+- No external APIs, geocoding, business registries or internet
+  lookups anywhere in src/. The pipeline never calls Claude or any
+  hosted model. Claude Code is only a development tool.
+- Every model in the final pipeline: MIT or Apache 2.0, at most 8B
+  parameters. [Mentor 5] Check the model card before using any
+  pretrained model. Record name, license and parameter count.
+- Allowed core libraries: pandas, pyarrow, numpy, scipy, scikit-learn
+  (BSD), rapidfuzz (MIT), lightgbm (MIT), pytest. Any new dependency
+  needs the lead's approval and a license check.
+- Avoid: unidecode (GPL — use unicodedata NFKD), libpostal (gray area,
+  trained on OpenStreetMap data).
+- Country is an open set of labels. France records go through every
+  stage. No filtering, hard-coding or one-hot of countries.
+- [Mentor 6] Everything reproduces from src/ via one command. CLAUDE.md
+  and the Colab notebook may stay in the repo but are not needed to
+  reproduce.
+
+=====================================================================
+4. TEAM ROLES, BACKUPS AND SHIFTS
+=====================================================================
+Member 1 — Lead / Integration (Aditya)
+  Repo, contracts, io_utils, scorer, dev sample, runner, decision
+  layer, Colab/Kaggle full runs, leaderboard submissions, README,
+  final zip. Backup: Member 4.
+Member 2 — Data and Normalisation
+  EDA, normalize.py, dictionaries (incl. French), LOCO experiments,
+  documentation lead. Backup: Member 3.
+Member 3 — Blocking
+  All candidate passes, reverse features, recall and reduction-ratio
+  reports, scaling, reproduction test. Backup: Member 2.
+Member 4 — Features and Model
+  features.py, model.py, OOF predictions, feature importance, error
+  analysis lead. Backup: Member 1.
+
+Shifts
+Pair A = Members 1 + 2 | Pair B = Members 3 + 4
+Sat 02:00-05:30  Pair A works. Pair B sleeps.
+Sat 05:30-10:30  Pair A sleeps. Pair B starts at 08:00.
+Sat 10:30-Sun 00:00  Everyone.
+Sun 00:00-05:00  Pair B sleeps. Pair A starts the full Colab run.
+Sun 04:30-09:30  Pair A sleeps. Pair B monitors and starts error
+                 analysis.
+Sun 09:30-23:59  Everyone.
+
+=====================================================================
+5. COMPUTE AND ENVIRONMENT
+=====================================================================
+Machines
+- Laptops (MacBook Air, Windows): development on the dev sample only.
+- Google Colab: the canonical machine for all full-data runs.
+- Kaggle notebook (about 30 GB RAM): backup for memory-heavy runs.
+  Data uploaded as a PRIVATE Kaggle dataset only.
+- Colab Pro High-RAM is optional, not required.
+
+Memory design (target: whole pipeline under 12 GB)
+- Process one country group at a time (plus the fallback pass if
+  needed).
+- String IDs mapped to integer indices internally, converted back only
+  when writing TSVs.
+- TF-IDF top-K by chunked sparse multiplication (5k-20k S1 rows per
+  chunk), float32. Never a full similarity matrix.
+- Features computed in chunks and written as parquet parts.
+- Load only the needed parquet columns. del + gc.collect() between
+  stages.
+- If memory runs out: smaller chunks first, then smaller K.
+
+Colab reliability
+- Every stage writes to Google Drive and is skipped if its output
+  already exists (--force to rerun).
+- The notebook only mounts Drive, clones the repo, installs
+  requirements and calls run_pipeline.py. No logic in the notebook.
+- Runtime and peak RAM logged per stage.
+
+Cross-platform rules
+- Same Python version as Colab for everyone (check `python --version`
+  on Colab, pin it in the README).
+- pathlib for all paths. No shell-only commands in Python.
+- multiprocessing only under if __name__ == "__main__".
+- Mac: brew install libomp before installing LightGBM.
+- encoding="utf-8" on every open. "\n" line endings on write.
+
+Dev sample (built by Member 1 in Phase 0)
+- Fixed seed. About 10% of train S1, stratified by country x singleton
+  flag, all their true matches, plus random other S2/S3 records as
+  distractors.
+- Debugging only. The sample has fewer distractors than real data, so
+  it overstates precision. Scores and thresholds come only from full
+  data.
+
+=====================================================================
+6. REPOSITORY, CONTRACTS AND CONVENTIONS
+=====================================================================
+Layout
+  code/business_entity_resolution/
+    src/
+      config.py          paths, seeds, K values, chunk sizes
+      io_utils.py        TSV read/write, parquet helpers
+      eda.py
+      make_dev_sample.py
+      normalize.py
+      blocking.py
+      features.py
+      model.py
+      decide.py
+      evaluate.py
+      run_pipeline.py    single entry point
+      tests/
+    README.md
+    requirements.txt     exact pinned versions
+  CLAUDE.md              (repo only, not needed to reproduce)
+  notebooks/colab_run.ipynb  (repo only)
+
+TSV reading (all code goes through io_utils.read_source)
+  sep="\t", dtype=str, keep_default_na=False, na_filter=False,
+  quoting=csv.QUOTE_NONE, encoding="utf-8"
+  Then assert row count = file line count - 1.
+  (QUOTE_NONE stops a stray " from swallowing lines. keep_default_na
+  stops a business named "NA" or an empty match list from becoming
+  NaN.)
+
+Data contracts (parquet, {split} = train or test)
+- records_{split}.parquet
+  entity_id, source (S1/S2/S3 from prefix), country, name_raw,
+  addr_raw, name_norm, name_core (legal suffix removed), legal_suffix,
+  name_acronym, addr_norm, postal_tokens (list), num_tokens (list),
+  landmark_flag, name_empty, addr_empty
+- candidates_{split}.parquet
+  s1_id, cand_id, cand_source, country_match (bool agreement flag,
+  not a country identity), pass_A_score, pass_A_rank, pass_B_score,
+  pass_B_rank, pass_C_score, pass_C_rank, pass_F_score, pass_F_rank,
+  n_passes, best_block_score, rev_n_s1, rev_rank, rev_gap
+- features_{split}/part-*.parquet
+  s1_id, cand_id, feature columns (float32), label (train only:
+  1 if cand_id is in the S1's ground-truth list)
+- oof_train.parquet: s1_id, cand_id, fold, prob, label
+- pred_test.parquet: s1_id, cand_id, prob
+- decision_config.json: t, t_empty, one_owner, optional per-source
+  thresholds. Tuned on train, applied unchanged to test.
+Nobody changes a contract without telling the lead.
+
+Runner
+  python -m src.run_pipeline --stage {prep,block,feat,train,predict,
+    decide,write,all} --split {train,test} --data-dir <path>
+    --out-dir <path> [--force] [--dev-sample]
+
+Git
+- main is always runnable and protected. Lead merges.
+- Branches: feat/<module>-<desc>, fix/<module>-<desc>.
+- PR checklist: runs on dev sample, tests pass, metric impact stated.
+- Commit messages: <module>: <what changed> (e.g. "blocking: add
+  postal-token pass C").
+
+=====================================================================
+7. SOLUTION ARCHITECTURE
+=====================================================================
+Stage 0 — Prep and normalisation (normalize.py)
+ Name: lowercase, NFKD accent strip, & -> and, punctuation -> space,
+ whitespace collapse, legal suffix extracted into its own column,
+ abbreviation expansion, acronym (first letters of core tokens).
+ Address: abbreviation expansion, postal-like tokens (every standalone
+ 5-6 digit number), all numeric tokens, landmark flag (near / opp /
+ behind / beside), token set.
+ Dictionaries are Python dicts in normalize.py. Every entry traces to
+ EDA evidence.
+
+Stage 1 — Blocking (blocking.py)
+ Pass A: char 3-gram TF-IDF on name_norm, top-K per S1 within the
+         country group.
+ Pass B: TF-IDF on name + address, top-K.
+ Pass C: records sharing a postal-like token, kept if name TF-IDF
+         cosine > a low bar (e.g. 0.2), top-K.
+ Pass F: cross-country fallback, name only, small K (only if E5
+         requires it).
+ Pass D: sentence-embedding ANN (stretch, Section 11).
+ Union all passes, keep per-pass score and rank, n_passes. Cap total
+ candidates per S1 (starting point 50) by best score.
+ Reverse features over ALL S1: rev_n_s1 (how many S1s got this record
+ as a candidate), rev_rank (this S1's rank among them), rev_gap
+ (score gap to that record's best S1).
+ Pair budget: (test S1 count) x (avg candidates per S1) must fit the
+ 12 GB chunked feature stage.
+
+Stage 2 — Features (features.py)
+ Name: ratio, token_set, token_sort, partial, Jaro-Winkler, normalised
+ Levenshtein on name_norm and name_core; char and word TF-IDF cosine;
+ IDF-weighted token overlap; rare shared token flag; acronym match
+ (both directions); legal suffix agree / conflict / missing; length
+ ratio; first-token match; digit-token agreement.
+ Address: postal-like token equal / conflict / one missing; house
+ number agreement; token Jaccard; TF-IDF cosine; landmark flags;
+ missing-field flags.
+ Group context: rank within the S1, gap to top score, candidate count,
+ z-score within the S1.
+ Blocking: per-pass scores and ranks, n_passes, reverse features,
+ country_match.
+ Source flag (S2 vs S3).
+ NO country identity features.
+
+Stage 3 — Model (model.py)
+ LightGBM binary classifier. GroupKFold(5) by s1_id over all train S1.
+ Early stopping, deterministic=True, fixed seed and num_threads.
+ Saves OOF predictions for every train pair, 5 fold models, gain
+ feature importance. Test probability = mean of the 5 fold models.
+
+Stage 4 — Decision layer (decide.py)
+ 1. One-owner rule (if E3 supports it and it validates better): each
+    S2/S3 record kept only for its highest-probability S1, across the
+    whole split.
+ 2. Per S1: keep candidates with p >= t. Empty list if max p < t_empty.
+ 3. t and t_empty (optional per-source thresholds) tuned by grid
+    search on full train OOF for macro F0.5. Saved to
+    decision_config.json and applied unchanged to test.
+
+Stage 5 — Output
+ Write both TSVs via io_utils. Run the official validator every time.
+
+=====================================================================
+8. VALIDATION PROTOCOL
+=====================================================================
+- Scorer must reproduce the README example (0.714) and pass the edge-
+  case unit tests before any result is trusted.
+- Blocking is unsupervised and runs on the full train split (all S1
+  against the full S2/S3 pool).
+- Model: OOF predictions for ALL train S1 via GroupKFold(5) by S1.
+- Decision layer: applied to all train OOF at once [Mentor 1].
+- Every experiment reports: pair recall, % S1 fully covered, avg
+  candidates per S1, macro F0.5 overall / singleton / non-singleton /
+  per country, LOCO score.
+- LOCO: train on US -> score India; train on India -> score US. This
+  is our proxy for France.
+- Accept a change only if global macro F0.5 improves by >= 0.002 and
+  LOCO drops by no more than 0.005.
+- Compare train vs test distributions (candidates per S1, max
+  probability, predicted-empty rate) to catch density shift.
+
+=====================================================================
+9. TIMELINE AND MILESTONES
+=====================================================================
+M0  Sat 05:30  Repo + scorer verified (0.714) + EDA summary posted
+M1  Sat 15:00  Baseline end-to-end, validator PASS, first SCORED
+               leaderboard submission  <- most important milestone
+M2  Sun 00:00  Multi-pass blocking + LightGBM + decision layer, global
+               OOF score, submission uploaded, full test run started
+M3  Sun 13:00  Best model after error analysis, submission uploaded
+M4  Sun 18:00  CODE FREEZE, final outputs from main, tagged v-final
+M5  Sun 21:00  Fresh-clone reproduction matches frozen outputs
+M6  Sun 22:00  Final zip submitted + final leaderboard upload
+    Sun 22:00-23:59  Buffer. Nothing new goes in.
+If a milestone slips by more than 2 hours, the lead cuts from the cut
+list (Section 12).
+
+=====================================================================
+10. PHASE-BY-PHASE TASKS
+=====================================================================
+---------------------------------------------------------------------
+PHASE 0 — FOUNDATION (Sat 02:00-05:30, Pair A)
+---------------------------------------------------------------------
+MEMBER 1
+ 1. Private GitHub repo, layout from Section 6, protected main.
+ 2. Check Colab's Python version, pin it. Start requirements.txt.
+ 3. Write CLAUDE.md (Section 18).
+ 4. io_utils.py: read_source(), write_id_list_tsv(), parquet helpers.
+ 5. evaluate.py: scorer + unit tests (0.714 example + all edge cases),
+    blocking recall report, F0.5 breakdowns.
+ 6. make_dev_sample.py (Section 5).
+ 7. Ground-truth parser: split on commas, empty -> empty set.
+
+MEMBER 2 — EDA (plain-text summary posted by 05:30)
+ E1  Rows per source per country, train and test. Test/train size
+     ratio per source. France counts per source in test.
+ E2  % singleton S1. Matches per S1 (S2 vs S3).
+ E3  One-owner check: % of matched S2/S3 IDs in more than one S1 list.
+ E4  % of train S2/S3 in no ground-truth list (distractors).
+ E5  % of true pairs with the same country label. List every mismatch
+     pattern.
+ E6  Empty/missing rate per field, per source, per country.
+ E7  % of records with a 5-6 digit token. For true pairs where both
+     have one, % that agree.
+ E8  % of true pairs with an exact match on lowercase alphanumeric
+     name.
+ E9  Char 3-gram TF-IDF name cosine: true pairs vs random pairs
+     (quantiles).
+ E10 Top 100 name and address tokens per country, incl. test France.
+ E11 30 random true pairs per country, each tagged with its noise
+     types (abbreviation, typo, reorder, transliteration, missing
+     field, landmark, DBA name).
+ E12 Non-ASCII characters by country.
+
+---------------------------------------------------------------------
+PHASE 1 — BASELINE (Sat 08:00-15:00) -> M1
+---------------------------------------------------------------------
+MEMBER 3 (from 08:00) — Blocking v0
+ - Temporary minimal normalisation until normalize.py lands.
+ - Pass A (plus Pass F if E5 needs it). Chunked top-K, float32.
+ - candidates.parquet per contract.
+ - Recall at K = 5, 10, 20, 50 on full train (Colab). Runtime and RAM.
+ PASS: recall report exists, runs under 12 GB on full train.
+
+MEMBER 4 (from 08:00) — Features v0 + rule baseline
+ - rapidfuzz ratio / token_set / token_sort / Jaro-Winkler on name and
+   address, TF-IDF cosine, postal-token agreement flag.
+ - Rule baseline: weighted mean of name and address similarity (used
+   for the first submission).
+ - LightGBM v0 with GroupKFold(5), OOF saved.
+
+MEMBER 2 (from 10:30) — normalize.py v1
+ - Everything in Stage 0, dictionaries from E10/E11.
+ - Unit tests on 20 real examples from E11.
+
+MEMBER 1 (from 10:30) — Runner + decision v0 + first submission
+ - run_pipeline.py with stage skipping and --force.
+ - decide.py v0: global t + t_empty, grid search on full train.
+ - Colab notebook.
+ - Test run -> both TSVs -> validator PASS -> upload.
+ PASS for M1: SCORED status, validation score logged.
+
+---------------------------------------------------------------------
+PHASE 2 — STRONG PIPELINE (Sat 15:00-Sun 00:00) -> M2
+---------------------------------------------------------------------
+MEMBER 3 — Blocking v1
+ - Passes B and C, candidate cap, union.
+ - Reverse features over all S1.
+ - Per-pass contribution report (true pairs found only by each pass).
+ - Pair budget estimate for test.
+ PASS: pair recall >= 98% on full train (target; if not reachable
+ within the pair budget, record the best value and the reason).
+
+MEMBER 4 — Features v1 + LightGBM
+ - Full Stage 2 feature list, chunked, float32.
+ - Full Stage 3 model, OOF for all train pairs, fold models, feature
+   importance.
+
+MEMBER 1 — Decision layer v1
+ - Full Stage 4 on all train OOF at once.
+ - Compare with / without the one-owner rule. Keep the better one.
+ - Report overall / singleton / non-singleton / per-country F0.5.
+
+MEMBER 2 — Normalisation v2 + LOCO + docs
+ - French dictionary from test France token counts (only tokens that
+   actually appear).
+ - LOCO experiments. Flag features that hurt LOCO to Member 4.
+ - Draft documentation sections 2.1 and 3 with real numbers.
+
+M2 PASS: global OOF macro F0.5 reported, validator PASS, submitted.
+Before Pair B sleeps: full v2 test run started on Colab.
+
+---------------------------------------------------------------------
+PHASE 3 — ERROR ANALYSIS (Sun 05:00-13:00) -> M3
+---------------------------------------------------------------------
+ Loop in Section 11. Pair B starts, Pair A joins at 09:30.
+ Go/no-go on the cross-encoder at Sun 09:30 (default: no).
+ France sanity checks:
+ - Compare predicted-empty rate and max-probability distribution for
+   France vs US/India in test.
+ - Spot-check that accents and French tokens survive normalisation.
+ - A big gap means a normalisation bug to fix, not a threshold to
+   tune. No hand-labelling.
+ M3: best accepted configuration run on test, validator PASS,
+ submitted.
+
+---------------------------------------------------------------------
+PHASE 4 — FREEZE (Sun 13:00-18:00) -> M4
+---------------------------------------------------------------------
+ - Merge everything to main. Remove dead code.
+ - Full run on a fresh Colab runtime from main: train -> test ->
+   outputs. Save the trained models.
+ - Validator with --check-ids (Kaggle if Colab runs out of memory).
+ - Final leaderboard upload.
+ - 18:00 CODE FREEZE, tag v-final.
+
+---------------------------------------------------------------------
+PHASE 5 — REPRODUCE AND SUBMIT (Sun 18:00-22:00) -> M5, M6
+---------------------------------------------------------------------
+ 18:00-21:00
+ - Member 3: fresh clone, fresh Colab runtime, follow ONLY the README.
+   Outputs must match the frozen files (row counts + checksum). If not,
+   fix determinism first.
+ - Members 2 + 4: finish documentation (Section 16).
+ - Member 1: README (Python version, install, exact commands, runtime
+   and RAM per stage, data folder layout, expected outputs), pinned
+   requirements.txt.
+ 21:00-22:00
+ - Build <team_name>_submission.zip (Section 17).
+ - Unzip in a temp folder, check structure against the official tree.
+ - Submit the zip. Screenshot the confirmation.
+
+=====================================================================
+11. ERROR ANALYSIS LOOP AND IMPROVEMENT PRIORITIES
+=====================================================================
+Loop
+ 1. From global OOF decisions, bucket errors:
+    B1 false merge on a singleton (costs 1.0)
+    B2 wrong extra match on a matched S1 (lowers precision)
+    B3 miss: true match not in candidates (blocking)
+    B4 miss: model or threshold rejected it
+ 2. Report each bucket as "F0.5 points lost".
+ 3. Pull 25 examples from the biggest bucket, tag causes.
+ 4. Fix the most common cause.
+ 5. Re-run on full train. Accept per Section 8, otherwise revert.
+ 6. Log it (below).
+
+Experiment log (shared sheet), one row per experiment:
+ id | owner | change | pair recall | avg cands/S1 | F0.5 overall |
+ singleton | non-singleton | US | India | LOCO | accepted Y/N | notes
+
+Improvement priorities (in order)
+ P1 Missing group-context or reverse features.
+ P2 Cross-source support: an S3 candidate that strongly matches an S2
+    candidate of the same S1.
+ P3 Expected-F0.5 subset selection per S1.
+ P4 Seed averaging (3 seeds) of LightGBM.
+ P5 Pass D embeddings, only if B3 misses are mainly transliteration or
+    word reordering. License check first. Colab GPU, float16
+    embeddings saved to Drive.
+ P6 Cross-encoder re-ranker for borderline pairs (default: skip).
+
+=====================================================================
+12. CUT LIST (cut from the top if time runs out)
+=====================================================================
+ 1. Cross-encoder (P6)
+ 2. Embedding pass (P5)
+ 3. Seed averaging (P4)
+ 4. Expected-F0.5 selection (P3)
+Never cut: global OOF validation, validator runs, reproduction test,
+documentation, zip structure check.
+
+=====================================================================
+13. LEADERBOARD POLICY
+=====================================================================
+- Member 1 confirms the submission limit on the portal in the first
+  hour.
+- Only Member 1 submits. Every submission is logged with its
+  experiment id and validation score.
+- The public leaderboard is a sanity check, not a tuning target. The
+  private leaderboard decides the ranking. Decisions follow our
+  validation.
+- Submit only after a validated improvement.
+
+=====================================================================
+14. RISK REGISTER
+=====================================================================
+R1 Colab out of memory -> chunking, smaller K, Kaggle 30 GB backup.
+R2 Colab disconnects -> stage checkpoints on Drive, resumable runner.
+R3 Test denser than train (more distractors) -> reverse features,
+   one-owner rule, compare train vs test score distributions.
+R4 France distribution shift -> country-agnostic features, LOCO,
+   France sanity checks.
+R5 Blocking silently loses matches (country labels, empty fields) ->
+   E5 check, fallback pass, per-pass recall report.
+R6 Validator rejection -> validator on every output, format tests.
+R7 Non-deterministic outputs -> fixed seeds, deterministic LightGBM,
+   fixed thread counts.
+R8 Merge conflicts -> module ownership, fixed contracts, small PRs.
+R9 Member unavailable -> backup owners (Section 4).
+R10 Portal problems near deadline -> zip submitted by 22:00, not 23:50.
+R11 Fatigue bugs -> shifts, handoff notes, tests before merging.
+
+=====================================================================
+15. COMMUNICATION PROTOCOL
+=====================================================================
+- One team chat channel for status, one for metrics.
+- Handoff note before every sleep and at every milestone:
+    DONE: ...
+    RUNNING: ... (where, expected finish time)
+    BLOCKED: ...
+    NEXT: ... (who does what)
+- Every metric posted with its experiment id.
+- A contract change is announced before it's merged.
+- Lead does a 10-minute sync at each milestone.
+
+=====================================================================
+16. DOCUMENTATION PLAN (Documentation_template.md)
+=====================================================================
+ 1   Executive summary ............................ Member 1
+ 2.1 Problem analysis (EDA numbers E1-E12) ........ Member 2
+ 2.2 Solution strategy ............................ Member 1
+ 3   Blocking: passes, K, recall, reduction ratio,
+     candidate count ............................... Member 3
+ 4   Features, model, hyperparameters, threshold
+     method, decision layer ........................ Member 4
+ 5   Results: OOF F0.5 by segment, LOCO, false
+     positive / false negative examples ........... Members 1 + 4
+ 6   Conclusion ................................... Member 1
+ A   Code structure, entry point, commands ........ Member 1
+ B   Feature importance, recall curves, experiment
+     log summary ................................... all
+ Also include: models used with licenses, dictionaries listed as
+ domain rules, transductive TF-IDF note, fair-play statement.
+
+=====================================================================
+17. FINAL SUBMISSION CHECKLIST
+=====================================================================
+Output files
+[ ] One row per test S1, France included. Empty lists allowed.
+[ ] Tab-separated, UTF-8, "\n" endings, exact headers.
+[ ] No S1 IDs in lists, no duplicate IDs, no duplicate rows.
+[ ] Matches are a subset of candidates.
+[ ] Validator prints PASS (also run once with --check-ids).
+Zip structure
+  <team_name>_submission.zip
+  ├── output/
+  │   ├── matching_results.tsv
+  │   └── candidate_pairs.tsv
+  ├── code/
+  │   └── business_entity_resolution/
+  │       ├── src/
+  │       ├── README.md
+  │       └── requirements.txt
+  └── Documentation_template.md
+[ ] Fresh-clone run reproduced both files.
+[ ] README works without CLAUDE.md or the notebook.
+[ ] No external API calls anywhere in src/.
+[ ] All models listed with MIT/Apache 2.0 licenses.
+[ ] Zip unzipped and checked before submitting.
+
+=====================================================================
+18. CLAUDE.md CONTENTS
+=====================================================================
+- Problem summary and metric rules (Section 1).
+- Data contracts and runner interface (Section 6).
+- Hard rules: no external APIs or internet lookups in src/; no country
+  hard-coding or country identity features; read TSVs only via
+  io_utils.read_source; UTF-8 everywhere; pathlib paths;
+  multiprocessing under if __name__ == "__main__"; must run under
+  12 GB RAM; chunk anything that scales with pairs; float32; fixed
+  seeds.
+- Allowed libraries with licenses. New dependencies need lead
+  approval.
+- Workflow: dev sample first, then full data on Colab. Every change
+  reports its metric impact.
+
+=====================================================================
+19. CLAUDE CODE STARTER PROMPTS
+=====================================================================
+Paste after Claude Code has read CLAUDE.md.
+
+MEMBER 1 — io + scorer
+"Read CLAUDE.md. Create src/io_utils.py with read_source() and
+write_id_list_tsv() as specified in CLAUDE.md, and src/evaluate.py
+with a macro F0.5 scorer following the per-S1 rules (empty/empty = 1,
+empty truth + non-empty pred = 0, non-empty truth + empty pred = 0).
+Add pytest tests in src/tests/, including the README example that
+must give 0.714. Add a blocking recall report (pair recall, % of S1
+fully covered) and F0.5 breakdowns by singleton flag and country.
+Show me the test output."
+
+MEMBER 1 — decision layer
+"Read CLAUDE.md. Write src/decide.py that takes OOF probabilities for
+ALL train pairs, optionally applies a one-owner rule across the whole
+split (each S2/S3 ID kept only for its highest-probability S1), then
+per S1 selects candidates with p >= t and returns an empty list if
+max p < t_empty. Grid-search t and t_empty for macro F0.5 using
+evaluate.py, with and without the one-owner rule. Print overall /
+singleton / non-singleton / per-country scores and save the best
+settings to decision_config.json."
+
+MEMBER 2 — EDA
+"Read CLAUDE.md. Write src/eda.py that loads train and test data via
+io_utils and prints a plain-text report answering these questions
+with numbers: [paste E1-E12]. It must run on full data under 12 GB
+RAM. Run it on the dev sample first and show me the output."
+
+MEMBER 2 — normalisation
+"Read CLAUDE.md. Write src/normalize.py producing
+records_{split}.parquet with the contract columns. Name: lowercase,
+unicodedata NFKD accent strip (no unidecode), & -> and, punctuation
+to space, legal suffix extracted to its own column, abbreviation
+expansion, acronym. Address: abbreviation expansion, postal_tokens =
+every standalone 5-6 digit number (no country-specific logic),
+num_tokens, landmark_flag. Dictionaries as Python dicts at the top of
+the file. Add unit tests from these real examples: [paste 20 from
+E11]."
+
+MEMBER 3 — blocking
+"Read CLAUDE.md. Write src/blocking.py implementing Pass A: char
+3-gram TF-IDF (float32) on name_norm, fitted per split on S1+S2+S3 of
+that split, grouped by country, top-K S2/S3 per S1 via chunked sparse
+matrix multiplication (chunk size configurable), no full similarity
+matrix. Output candidates.parquet with the contract columns
+(pass_A_score, pass_A_rank). Add a recall report at K = 5, 10, 20, 50
+using evaluate.py. Log runtime and peak memory. Test on the dev
+sample first."
+
+MEMBER 4 — features + model
+"Read CLAUDE.md. Write src/features.py that reads candidates and
+records parquet files and computes these pairwise features: [paste
+Stage 2 list], in chunks, writing features parquet parts in float32.
+No country identity features. Then write src/model.py: LightGBM with
+GroupKFold(5) by s1_id over all train S1, early stopping,
+deterministic=True, fixed seed and num_threads, saving OOF
+predictions for every train pair, the 5 fold models, and gain feature
+importance."

@@ -1,0 +1,14 @@
+# Python 3.13 (tested on 3.13.13 macOS and 3.13.15 on Colab)
+pandas==3.0.6
+pyarrow==25.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+rapidfuzz==3.14.6
+lightgbm==4.7.0
+
+# Dev / QA
+pytest==9.1.1
+mypy==2.3.1
+pandas-stubs==3.0.5.260914
+scipy-stubs==1.18.1.1

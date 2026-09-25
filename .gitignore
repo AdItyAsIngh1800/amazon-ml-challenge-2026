@@ -1,0 +1,14 @@
+# Data never leaves this machine
+dataset/
+output/*.tsv
+artifacts/
+*.parquet
+
+# Environment / tooling
+.venv/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.DS_Store
+*.ipynb_checkpoints
+.claude/settings.local.json

@@ -1,0 +1,24 @@
+[project]
+name = "business-entity-resolution"
+version = "0.1.0"
+description = "Amazon ML Challenge 2026 - Business Entity Resolution pipeline"
+requires-python = ">=3.13,<3.14"
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+
+# Libraries without type stubs.
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "lightgbm.*", "pyarrow.*"]
+ignore_missing_imports = true
