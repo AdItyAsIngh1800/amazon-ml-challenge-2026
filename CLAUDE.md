@@ -138,7 +138,8 @@ Tests first (TDD) for evaluate.py and io_utils.py.
 - Every change reports metric impact: pair recall, % S1 fully covered, avg
   cands/S1, F0.5 overall/singleton/non-singleton/per country, LOCO.
 - Accept a change only if global F0.5 +>= 0.002 and LOCO drops <= 0.005.
-- Git: main protected, lead merges. Branches feat/<module>-<desc>,
+- Never push directly to main; all changes go through a PR. Lead merges.
+  (GitHub branch protection is unavailable on our plan.) Branches feat/<module>-<desc>,
   fix/<module>-<desc>. Commits "<module>: <what changed>". PR checklist:
   runs on dev sample, tests pass, metric impact stated.
 
