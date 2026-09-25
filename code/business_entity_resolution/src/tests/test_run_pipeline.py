@@ -29,10 +29,25 @@ def test_stage_wrong_split_raises() -> None:
         run_pipeline.stages_for("train", "test")
 
 
-def test_unimplemented_stage_names_owner(tmp_path: Path) -> None:
-    """The first missing stage raises with its owning module."""
-    with pytest.raises(NotImplementedError, match="normalize.py"):
-        run_pipeline.run("all", "train", _paths(tmp_path))
+def test_stages_wired_to_owner_modules() -> None:
+    """Each stage calls run_stage from its owner's module."""
+    from src import blocking, decide, features, model, normalize
+
+    expected = {"prep": normalize, "block": blocking, "feat": features, "train": model,
+                "predict": model, "decide": decide, "write": decide}
+    for name, module in expected.items():
+        assert run_pipeline.STAGES[name].run is module.run_stage
+        assert run_pipeline.STAGES[name].owner == module.OWNER
+
+
+@pytest.mark.parametrize(("stage", "split", "owner"), [
+    ("block", "train", "blocking.py"), ("feat", "test", "features.py"), ("train", "train", "model.py"),
+    ("predict", "test", "model.py"), ("decide", "train", "decide.py"), ("write", "test", "decide.py"),
+])
+def test_unimplemented_stages_name_owner(tmp_path: Path, stage: str, split: str, owner: str) -> None:
+    """Stub stages raise NotImplementedError naming the owning module."""
+    with pytest.raises(NotImplementedError, match=owner):
+        run_pipeline.run(stage, split, _paths(tmp_path))
 
 
 def test_existing_outputs_are_skipped_unless_force(tmp_path: Path) -> None:
@@ -43,7 +58,7 @@ def test_existing_outputs_are_skipped_unless_force(tmp_path: Path) -> None:
     run_pipeline.run("prep", "train", paths)  # skipped, no error
     with pytest.raises(NotImplementedError, match="blocking.py"):
         run_pipeline.run("all", "train", paths)  # prep skipped, block reached
-    with pytest.raises(NotImplementedError, match="normalize.py"):
+    with pytest.raises(FileNotFoundError):  # prep really runs; no data in tmp
         run_pipeline.run("prep", "train", paths, force=True)
 
 
