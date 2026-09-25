@@ -41,7 +41,7 @@ def test_stages_wired_to_owner_modules() -> None:
 
 
 @pytest.mark.parametrize(("stage", "split", "owner"), [
-    ("block", "train", "blocking.py"), ("feat", "test", "features.py"), ("train", "train", "model.py"),
+    ("feat", "test", "features.py"), ("train", "train", "model.py"),
     ("predict", "test", "model.py"), ("decide", "train", "decide.py"), ("write", "test", "decide.py"),
 ])
 def test_unimplemented_stages_name_owner(tmp_path: Path, stage: str, split: str, owner: str) -> None:
@@ -56,8 +56,8 @@ def test_existing_outputs_are_skipped_unless_force(tmp_path: Path) -> None:
     paths.artifacts_dir.mkdir(parents=True)
     (paths.artifacts_dir / "records_train.parquet").touch()
     run_pipeline.run("prep", "train", paths)  # skipped, no error
-    with pytest.raises(NotImplementedError, match="blocking.py"):
-        run_pipeline.run("all", "train", paths)  # prep skipped, block reached
+    with pytest.raises(ValueError, match="Parquet"):  # prep skipped, block reads the empty file
+        run_pipeline.run("all", "train", paths)
     with pytest.raises(FileNotFoundError):  # prep really runs; no data in tmp
         run_pipeline.run("prep", "train", paths, force=True)
 
