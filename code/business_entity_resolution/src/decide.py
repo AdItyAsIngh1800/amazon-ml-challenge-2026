@@ -399,7 +399,7 @@ def run_write(paths: Paths) -> None:
     """
     cfg_path = paths.artifacts_dir / DECISION_CONFIG
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    io_utils.require_columns(cfg.keys(), (*contracts.DECISION_CONFIG_KEYS, "score_column"), str(cfg_path))
+    io_utils.require_columns(cfg.keys(), contracts.DECISION_CONFIG_KEYS, str(cfg_path))
     ids = load_split_ids(paths, "test")
     pairs = load_pairs(paths.artifacts_dir / "pred_test.parquet", cfg["score_column"], ids, with_label=False)
     keep = one_owner_mask(pairs, len(ids.cand)) if cfg["one_owner"] else np.ones(len(pairs.s1), dtype=bool)
