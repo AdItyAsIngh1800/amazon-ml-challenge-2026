@@ -174,6 +174,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--artifacts-dir", type=Path, default=None, help="folder for stage artifacts and logs")
     p.add_argument("--force", action="store_true", help="rerun stages whose outputs exist")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument("--decide-score-column", choices=("prob", "score"), default=None,
+                   help=f"decision input column: model 'prob' or rule-baseline 'score' "
+                        f"(default {config.DECIDE_SCORE_COLUMN})")
     for flag, name in CONFIG_OVERRIDES.items():
         p.add_argument(f"--{flag.replace('_', '-')}", type=int, default=None,
                        help=f"override config.{name} (default {getattr(config, name)})")
@@ -194,6 +197,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         if value is not None:
             setattr(config, name, value)
         logger.info("config.%s = %s", name, getattr(config, name))
+    if args.decide_score_column is not None:
+        config.DECIDE_SCORE_COLUMN = args.decide_score_column
+    logger.info("config.DECIDE_SCORE_COLUMN = %s", config.DECIDE_SCORE_COLUMN)
     command = "src.run_pipeline " + " ".join(sys.argv[1:] if argv is None else argv)
     with fulldata_lock(paths.data_dir, command):
         run(args.stage, args.split, paths, args.force)
