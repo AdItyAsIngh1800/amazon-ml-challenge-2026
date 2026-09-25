@@ -7,10 +7,13 @@ before Member 2's full version lands. Member 2 replaces the internals
 changing the output contract (contracts.RECORDS_COLUMNS and RECORDS_SCHEMA).
 
 v0 rules:
-- name_norm / addr_norm: NFKD, lowercase, strip Latin combining accents
+- name_translit / addr_translit: raw text with Indic scripts romanised and
+  Indic digits made ASCII (transliterate.transliterate), done first.
+- name_norm / addr_norm: from the transliterated text: NFKD, lowercase, strip Latin combining accents
   (U+0300-U+036F only, so Devanagari virama/nukta/vowel signs survive),
   "&" -> " and ", punctuation / symbols / whitespace / control chars -> space,
   spaces collapsed.
+- name_key = transliterate.phonetic_key(name_norm).
 - name_core = name_norm, legal_suffix = "" (placeholders).
 - name_acronym = first character of each name_norm token.
 - postal_tokens = every standalone 5-6 digit ASCII number in addr_norm.
@@ -35,7 +38,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src import io_utils
+from src import io_utils, transliterate
 from src.config import Paths
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,7 @@ RECORDS_SCHEMA = pa.schema([
     ("name_acronym", _STR), ("addr_norm", _STR),
     ("postal_tokens", _LIST), ("num_tokens", _LIST),
     ("landmark_flag", pa.bool_()), ("name_empty", pa.bool_()), ("addr_empty", pa.bool_()),
+    ("name_translit", _STR), ("addr_translit", _STR), ("name_key", _STR),
 ])
 
 _LANDMARK_RE = r"(?:^| )(?:" + "|".join(LANDMARK_WORDS) + r")(?: |$)"
@@ -119,14 +123,17 @@ def build_records(src: pd.DataFrame, source: str) -> pd.DataFrame:
     Returns:
         One row per record with columns ``contracts.RECORDS_COLUMNS``:
         strings, ``postal_tokens`` / ``num_tokens`` as lists of str, and bool
-        ``landmark_flag`` / ``name_empty`` / ``addr_empty``.
+        ``landmark_flag`` / ``name_empty`` / ``addr_empty``. Transliteration
+        runs per string only on names/addresses containing Indic script.
 
     Raises:
         ValueError: If a source column is missing.
     """
     io_utils.require_columns(src.columns, io_utils.SOURCE_COLUMNS, f"build_records({source})")
-    name_norm = normalize_text(src["business_name"])
-    addr_norm = normalize_text(src["business_address"])
+    name_translit = transliterate.transliterate(src["business_name"])
+    addr_translit = transliterate.transliterate(src["business_address"])
+    name_norm = normalize_text(name_translit)
+    addr_norm = normalize_text(addr_translit)
     return pd.DataFrame({
         "entity_id": src["entity_id"],
         "source": source,
@@ -143,6 +150,9 @@ def build_records(src: pd.DataFrame, source: str) -> pd.DataFrame:
         "landmark_flag": landmark_flag(addr_norm),
         "name_empty": name_norm.eq(""),
         "addr_empty": addr_norm.eq(""),
+        "name_translit": name_translit,
+        "addr_translit": addr_translit,
+        "name_key": transliterate.phonetic_key(name_norm),
     })
 
 

@@ -7,10 +7,14 @@ Changing a contract needs the lead's approval.
 from __future__ import annotations
 
 # records_{split}.parquet — one row per S1/S2/S3 record.
+# name_translit / addr_translit: raw text with Indic scripts romanised
+# (transliterate.py); name_norm / addr_norm are built from them.
+# name_key: phonetic key of name_norm (transliterate.phonetic_key).
 RECORDS_COLUMNS: tuple[str, ...] = (
     "entity_id", "source", "country", "name_raw", "addr_raw",
     "name_norm", "name_core", "legal_suffix", "name_acronym", "addr_norm",
     "postal_tokens", "num_tokens", "landmark_flag", "name_empty", "addr_empty",
+    "name_translit", "addr_translit", "name_key",
 )
 
 # candidates_{split}.parquet — one row per (S1, S2/S3 candidate) pair.
