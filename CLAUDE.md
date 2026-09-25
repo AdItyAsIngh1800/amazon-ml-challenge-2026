@@ -66,9 +66,18 @@ Nobody changes a contract without telling the lead.
 ## Runner (single entry point, run from code/business_entity_resolution/)
 ```
 python -m src.run_pipeline --stage {prep,block,feat,train,predict,decide,write,all}
-  --split {train,test} --data-dir PATH --out-dir PATH [--force] [--log-level INFO]
+  --split {train,test} --data-dir PATH --out-dir PATH [--artifacts-dir PATH]
+  [--force] [--log-level INFO] [--block-top-k N ... config overrides]
 ```
-Each stage skips if its output exists unless --force. Logs runtime + peak RAM.
+- train split `all` = prep, block, feat, train, decide; test split `all` =
+  prep, block, feat, predict, write. Run train first, then test.
+- Each stage skips if its outputs exist unless --force; logs runtime + peak RSS.
+- An artifacts dir is tied to the --data-dir that built it (run_meta.json).
+  Dev runs: `--data-dir ../../artifacts/dev_sample --artifacts-dir ../../artifacts/dev_run`.
+- To implement a stage, replace its placeholder in `run_pipeline.STAGES` with
+  a `(paths, split) -> None` function from your module.
+- Read tunables as `config.NAME` at call time (never `from src.config import
+  NAME`) so CLI overrides apply.
 
 ## Hard rules
 - NO network calls in src/: no external APIs, geocoding, registries, lookups,
@@ -79,15 +88,19 @@ Each stage skips if its output exists unless --force. Logs runtime + peak RAM.
 - Postal-like tokens = every standalone 5-6 digit number, all countries.
 - UTF-8 on every open, "\n" on write. pathlib for all paths.
 - multiprocessing only under `if __name__ == "__main__":`.
-- Target peak RAM 10 GB (hard limit 12 GB). Chunk anything that scales with pairs.
-  Never build a full similarity matrix. float32. Integer IDs internally.
+- Machine: MacBook Air, 16 GB. Peak RAM target <= 10 GB. Chunk anything that
+  scales with pairs (config.BLOCK_CHUNK_S1_ROWS, config.FEATURE_CHUNK_PAIRS).
+  Measure per stage with `logging_utils.track_stage` (psutil), never
+  resource.ru_maxrss (unit differs by OS).
+  Never build a full similarity matrix. float32 scores/features
+  (config.FLOAT_DTYPE), int32 ID indices (config.INDEX_DTYPE).
 - Fixed seeds (config.SEED = 42), deterministic LightGBM, fixed num_threads.
 - Models: MIT or Apache 2.0, <= 8B params; record name/license/params.
 
 ## Allowed libraries (new deps need lead approval + license check)
 pandas (BSD), pyarrow (Apache 2.0), numpy (BSD), scipy (BSD),
 scikit-learn (BSD), rapidfuzz (MIT), lightgbm (MIT), pytest (MIT),
-mypy (MIT). Avoid: unidecode (GPL; use unicodedata NFKD), libpostal.
+mypy (MIT), psutil (BSD-3). Avoid: unidecode (GPL; use unicodedata NFKD), libpostal.
 
 ## Code quality standards (every file, every checkpoint)
 Docstrings
@@ -115,6 +128,9 @@ Definition of done: `pytest` passes AND `mypy` reports 0 errors on src/.
 Tests first (TDD) for evaluate.py and io_utils.py.
 
 ## Workflow
+- Claude Code sessions run ONLY on the dev sample. Never start a full-data
+  run; ask the lead, who runs it in a separate terminal with caffeinate -i
+  (logs in artifacts/logs/).
 - Dev sample first (`artifacts/dev_sample/`, via --data-dir), then full data
   on the Mac (Member 1). Dev-sample scores overstate precision; thresholds come only from
   full data.
