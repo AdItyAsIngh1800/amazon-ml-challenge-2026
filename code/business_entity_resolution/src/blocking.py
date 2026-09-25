@@ -14,7 +14,7 @@ from src.config import Paths
 
 logger = logging.getLogger(__name__)
 
-OWNER = "blocking.py (Member 3)"
+OWNER = "blocking.py (lane block)"
 
 
 def run_stage(paths: Paths, split: str) -> None:
@@ -25,6 +25,6 @@ def run_stage(paths: Paths, split: str) -> None:
         split: ``"train"`` or ``"test"``.
 
     Raises:
-        NotImplementedError: Until blocking.py (Member 3) implements this stage.
+        NotImplementedError: Until blocking.py (lane block) implements this stage.
     """
     raise NotImplementedError(f"{__name__}.run_stage ({split}) is not implemented yet; owner: {OWNER}")

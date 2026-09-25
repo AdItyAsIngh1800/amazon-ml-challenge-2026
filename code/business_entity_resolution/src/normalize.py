@@ -2,7 +2,7 @@
 
 *** PREP v0 (lead's stop-gap) ***
 Minimal, country-agnostic normalisation so blocking and features can start
-before Member 2's full version lands. Member 2 replaces the internals
+before the norm lane's full version lands. The norm lane replaces the internals
 (legal-suffix extraction, abbreviation dictionaries, better acronyms) WITHOUT
 changing the output contract (contracts.RECORDS_COLUMNS and RECORDS_SCHEMA).
 
@@ -40,7 +40,7 @@ from src.config import Paths
 
 logger = logging.getLogger(__name__)
 
-OWNER = "normalize.py (Member 2)"
+OWNER = "normalize.py (lane norm)"
 PREP_CHUNK_ROWS = 500_000
 LANDMARK_WORDS: tuple[str, ...] = ("near", "opp", "opposite", "behind", "beside")
 
