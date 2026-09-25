@@ -15,7 +15,7 @@ from src.config import Paths
 
 logger = logging.getLogger(__name__)
 
-OWNER = "decide.py (Member 1)"
+OWNER = "decide.py (lane A, lead)"
 
 
 def run_stage(paths: Paths, split: str) -> None:
@@ -26,6 +26,6 @@ def run_stage(paths: Paths, split: str) -> None:
         split: ``"train"`` or ``"test"``.
 
     Raises:
-        NotImplementedError: Until decide.py (Member 1) implements this stage.
+        NotImplementedError: Until decide.py (lane A, lead) implements this stage.
     """
     raise NotImplementedError(f"{__name__}.run_stage ({split}) is not implemented yet; owner: {OWNER}")

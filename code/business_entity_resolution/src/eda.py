@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import gc
 import logging
+import sys
 import time
 import unicodedata
 from collections import Counter, defaultdict
@@ -37,6 +38,7 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.preprocessing import normalize as l2_normalize
 
 from src import config, io_utils, normalize
+from src.fulldata_lock import fulldata_lock
 from src.logging_utils import setup_logging, track_stage
 
 logger = logging.getLogger(__name__)
@@ -702,7 +704,7 @@ def main() -> None:
     args = parser.parse_args()
     paths = config.get_paths(data_dir=args.data_dir, artifacts_dir=args.artifacts_dir)
     setup_logging(args.log_level, paths.log_dir)
-    with track_stage("eda"):
+    with fulldata_lock(paths.data_dir, "src.eda " + " ".join(sys.argv[1:])), track_stage("eda"):
         run_eda(paths.data_dir, paths.artifacts_dir, n_rank_s1=args.n_rank_s1)
 
 

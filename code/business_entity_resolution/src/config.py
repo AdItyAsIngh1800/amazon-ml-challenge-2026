@@ -27,6 +27,28 @@ import numpy as np
 # code/business_entity_resolution/src/config.py -> repo root is parents[3].
 REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 
+
+def _main_checkout(root: Path) -> Path:
+    """Main working tree when ``root`` is a git worktree (its ``.git`` is a file), else ``root``.
+
+    A worktree's ``.git`` file reads ``gitdir: <main>/.git/worktrees/<name>``.
+    """
+    git = root / ".git"
+    if git.is_file():
+        text = git.read_text(encoding="utf-8").strip()
+        if text.startswith("gitdir:"):
+            gitdir = Path(text.split(":", 1)[1].strip())
+            if gitdir.parent.name == "worktrees":
+                return gitdir.parent.parent.parent
+    return root
+
+
+# Shared across all lane worktrees: the full dataset, the full-data lock and
+# the experiment log live in the main checkout.
+MAIN_ROOT: Path = _main_checkout(REPO_ROOT)
+SHARED_ARTIFACTS_DIR: Path = MAIN_ROOT / "artifacts"
+FULL_DATA_DIR: Path = Path(os.environ.get("BER_FULL_DATA_DIR", str(MAIN_ROOT / "dataset"))).expanduser().resolve()
+
 SEED: int = 42
 PEAK_RAM_TARGET_GB: float = 10.0
 
