@@ -130,22 +130,61 @@ def f05_breakdown(
     ids = s1_records["entity_id"].tolist()
     scores = per_s1_f05(pred, truth, ids)
     singleton = np.fromiter((not truth[s] for s in ids), dtype=bool, count=len(ids))
-    countries = s1_records["country"].to_numpy()
+    return segment_table(scores, singleton, s1_records["country"].to_numpy())
 
+
+def f05_from_counts(
+    tp: NDArray[np.integer] | NDArray[np.floating],
+    n_pred: NDArray[np.integer] | NDArray[np.floating],
+    n_truth: NDArray[np.integer] | NDArray[np.floating],
+) -> NDArray[np.float64]:
+    """Vectorised per-S1 F0.5 from counts, same rules as ``f05_single``.
+
+    F0.5 = 1.25PR / (0.25P + R) simplifies to 1.25 tp / (0.25 |truth| + |pred|);
+    both empty -> 1.0; exactly one empty -> 0.0 (the formula already gives 0).
+
+    Args:
+        tp: True positives per S1.
+        n_pred: Predicted IDs per S1.
+        n_truth: True IDs per S1 (from the ground truth, including matches the
+            candidates missed).
+
+    Returns:
+        float64 scores aligned with the inputs.
+    """
+    tp_f = np.asarray(tp, dtype=np.float64)
+    denom = 0.25 * np.asarray(n_truth, dtype=np.float64) + np.asarray(n_pred, dtype=np.float64)
+    out = np.divide(1.25 * tp_f, denom, out=np.zeros_like(tp_f), where=denom > 0)
+    out[denom == 0] = 1.0  # empty truth and empty prediction
+    return out
+
+
+def segment_table(scores: NDArray[np.float64], singleton: NDArray[np.bool_], countries: NDArray[np.object_]) -> pd.DataFrame:
+    """Macro F0.5 overall, singleton / non-singleton and per country from per-S1 scores.
+
+    Args:
+        scores: Per-S1 F0.5.
+        singleton: True where the S1 has no true match.
+        countries: Country label per S1.
+
+    Returns:
+        DataFrame with one row per segment: ``segment`` (``overall``,
+        ``singleton``, ``non_singleton``, ``country=<label>``), ``n_s1`` (int),
+        ``f05`` (float; NaN for an empty segment). Each row is also logged.
+    """
     segments: list[tuple[str, NDArray[np.bool_]]] = [
-        ("overall", np.ones(len(ids), dtype=bool)),
+        ("overall", np.ones(len(scores), dtype=bool)),
         ("singleton", singleton),
         ("non_singleton", ~singleton),
     ]
-    segments += [(f"country={c}", countries == c) for c in sorted(set(countries))]
+    segments += [(f"country={c}", countries == c) for c in sorted(set(countries.tolist()))]
     rows = [
         {"segment": name, "n_s1": int(m.sum()), "f05": float(scores[m].mean()) if m.any() else float("nan")}
         for name, m in segments
     ]
-    out = pd.DataFrame(rows)
     for r in rows:
         logger.info("F0.5 %-16s n=%-9d %.4f", r["segment"], r["n_s1"], r["f05"])
-    return out
+    return pd.DataFrame(rows)
 
 
 @dataclass(frozen=True)

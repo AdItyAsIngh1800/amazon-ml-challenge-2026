@@ -115,3 +115,37 @@ def test_blocking_recall_missing_column_raises() -> None:
     """Candidates without cand_id are rejected at the boundary."""
     with pytest.raises(ValueError, match="cand_id"):
         evaluate.blocking_recall_report(pd.DataFrame({"s1_id": []}), {}, [])
+
+
+# --- vectorised helpers used by decide.py -----------------------------------------
+
+def test_f05_from_counts_matches_f05_single() -> None:
+    """Closed form 1.25*tp/(0.25*|truth|+|pred|) with the empty rules == f05_single."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    cases = [({"a", "b", "c"}, {"a", "c"}), (set(), set()), ({"a"}, set()), (set(), {"a"}), ({"x"}, {"a"})]
+    for _ in range(200):
+        truth = {f"t{i}" for i in range(rng.integers(0, 5))}
+        pred = {x for x in truth if rng.random() < 0.6} | {f"f{i}" for i in range(rng.integers(0, 3))}
+        cases.append((pred, truth))
+    tp = np.array([len(p & t) for p, t in cases])
+    n_pred = np.array([len(p) for p, _ in cases])
+    n_truth = np.array([len(t) for _, t in cases])
+    got = evaluate.f05_from_counts(tp, n_pred, n_truth)
+    want = np.array([evaluate.f05_single(p, t) for p, t in cases])
+    np.testing.assert_allclose(got, want, atol=1e-12)
+    assert round(float(got[0]), 3) == 0.714
+
+
+def test_segment_table_matches_breakdown() -> None:
+    """segment_table on per-S1 scores gives the same rows as f05_breakdown."""
+    import numpy as np
+
+    s1 = pd.DataFrame({"entity_id": ["S1-1", "S1-2", "S1-3"], "country": ["US", "US", "France"]})
+    truth = {"S1-1": {"S2-1"}, "S1-2": set(), "S1-3": set()}
+    pred = {"S1-1": {"S2-1"}, "S1-2": {"S2-9"}}
+    ref = evaluate.f05_breakdown(pred, truth, s1)
+    scores = evaluate.per_s1_f05(pred, truth, s1["entity_id"].tolist())
+    got = evaluate.segment_table(scores, np.array([False, True, True]), s1["country"].to_numpy())
+    pd.testing.assert_frame_equal(got, ref)
