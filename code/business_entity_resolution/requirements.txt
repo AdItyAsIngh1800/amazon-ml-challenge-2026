@@ -6,9 +6,11 @@ scipy==1.18.1
 scikit-learn==1.9.1
 rapidfuzz==3.14.6
 lightgbm==4.7.0
+psutil==7.2.2
 
 # Dev / QA
 pytest==9.1.1
 mypy==2.3.1
 pandas-stubs==3.0.5.260914
 scipy-stubs==1.18.1.1
+types-psutil==7.2.2.20260906

@@ -8,32 +8,61 @@ Environment variables:
     BER_DATA_DIR: folder containing ``train/`` and ``test/`` TSV folders.
     BER_ARTIFACTS_DIR: folder for parquet artifacts, models and logs.
     BER_OUTPUT_DIR: folder for the two submission TSVs.
+
+The numeric values below are defaults sized for a 16 GB MacBook Air
+(pipeline peak RAM target 10 GB); run_pipeline exposes CLI flags to
+override them.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 # code/business_entity_resolution/src/config.py -> repo root is parents[3].
 REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 
 SEED: int = 42
+PEAK_RAM_TARGET_GB: float = 10.0
 
-# Blocking: S1 rows per chunk in chunked sparse top-K (plan: 5k-20k).
-CHUNK_SIZE: int = 10_000
-# Features: candidate pairs per parquet part.
-FEATURE_CHUNK_SIZE: int = 1_000_000
+# Dtypes: every score/feature is float32; internal ID indices are int32.
+FLOAT_DTYPE = np.float32
+INDEX_DTYPE = np.int32
 
-# Blocking K values (starting points; owner: blocking.py).
-TOP_K_PER_PASS: int = 50
+# Blocking (owner: blocking.py).
+BLOCK_CHUNK_S1_ROWS: int = 10_000
+BLOCK_TOP_K: int = 20  # per pass
 MAX_CANDIDATES_PER_S1: int = 50
 RECALL_K_VALUES: tuple[int, ...] = (5, 10, 20, 50)
 PASS_C_MIN_NAME_COSINE: float = 0.2
 
+# Features (owner: features.py): candidate pairs per parquet part.
+FEATURE_CHUNK_PAIRS: int = 300_000
+RAPIDFUZZ_WORKERS: int = -1  # all cores, for rapidfuzz.process.cdist
+
 N_FOLDS: int = 5
-MEMORY_BUDGET_GB: float = 12.0
+
+
+def _performance_cores() -> int:
+    """Number of performance cores on macOS, else ``os.cpu_count()`` (min 1)."""
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.perflevel0.physicalcpu"],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+            return max(1, int(out.stdout.strip()))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    return os.cpu_count() or 1
+
+
+LGBM_NUM_THREADS: int = _performance_cores()
 
 
 @dataclass(frozen=True)
