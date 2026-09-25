@@ -1,7 +1,6 @@
 # CLAUDE.md — Amazon ML Challenge 2026: Business Entity Resolution
 
-Single source of truth: `plan/final_plan.txt`. Implement it; do not re-plan.
-If the plan is ambiguous or conflicts with the data, stop and ask the lead.
+Source of truth: `plan/final_plan.txt`. Implement it; don't re-plan. Ambiguous or conflicts with data -> ask the lead.
 
 ## Problem
 For every Source 1 (S1) record, output all Source 2 / Source 3 records that
@@ -39,7 +38,7 @@ Always run `utils/validate_submission.py` on outputs.
 code/business_entity_resolution/
   src/  config.py io_utils.py eda.py make_dev_sample.py normalize.py
         blocking.py features.py model.py decide.py evaluate.py
-        logging_utils.py run_pipeline.py tests/
+        logging_utils.py contracts.py run_pipeline.py tests/
   README.md  requirements.txt  pyproject.toml
 artifacts/ (gitignored)   output/ (TSVs gitignored)
 ```
@@ -74,8 +73,10 @@ python -m src.run_pipeline --stage {prep,block,feat,train,predict,decide,write,a
 - Each stage skips if its outputs exist unless --force; logs runtime + peak RSS.
 - An artifacts dir is tied to the --data-dir that built it (run_meta.json).
   Dev runs: `--data-dir ../../artifacts/dev_sample --artifacts-dir ../../artifacts/dev_run`.
-- To implement a stage, replace its placeholder in `run_pipeline.STAGES` with
-  a `(paths, split) -> None` function from your module.
+- Implement `run_stage(paths, split)` in your own module (normalize, blocking,
+  features, model, decide). Do NOT edit run_pipeline.py. model.py (train/
+  predict) and decide.py (decide/write) branch on split. Contract columns:
+  `src/contracts.py`. prep v0 in normalize.py is the lead's stop-gap.
 - Read tunables as `config.NAME` at call time (never `from src.config import
   NAME`) so CLI overrides apply.
 
@@ -143,7 +144,5 @@ Tests first (TDD) for evaluate.py and io_utils.py.
 
 ## Commands
 ```
-cd code/business_entity_resolution
-python -m pytest -q
-python -m mypy
+cd code/business_entity_resolution && python -m pytest -q && python -m mypy
 ```
