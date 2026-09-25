@@ -143,6 +143,37 @@ def read_ground_truth(path: Path) -> dict[str, set[str]]:
     return truth
 
 
+def read_ground_truth_pairs(path: Path) -> pd.DataFrame:
+    """Read the ground-truth TSV as a long table (compact alternative to a dict).
+
+    Uses far less memory than ``read_ground_truth`` on the full data (Arrow
+    strings instead of millions of Python sets).
+
+    Args:
+        path: TSV with columns ``source1_entity_id, matched_entity_ids``.
+
+    Returns:
+        String columns ``s1_id, cand_id``: one row per true pair, in file
+        order; a singleton S1 has exactly one row with ``cand_id == ""``.
+
+    Raises:
+        ValueError: If a column is missing, the row count check fails, or an
+            S1 ID appears more than once.
+    """
+    df = _read_tsv(path, GROUND_TRUTH_COLUMNS)
+    s1_col, match_col = GROUND_TRUTH_COLUMNS
+    if df[s1_col].duplicated().any():
+        raise ValueError(f"{path}: duplicate {s1_col} rows")
+    long = (
+        df.assign(cand_id=df[match_col].str.split(","))
+        .explode("cand_id", ignore_index=True)
+        .rename(columns={s1_col: "s1_id"})[["s1_id", "cand_id"]]
+        .astype("str")
+    )
+    logger.info("Read %s: %d S1 rows, %d pair rows", path.name, len(df), len(long))
+    return long
+
+
 def write_id_list_tsv(
     mapping: Mapping[str, Iterable[str]],
     s1_ids: Sequence[str],
