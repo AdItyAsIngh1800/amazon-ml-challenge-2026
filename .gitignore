@@ -2,6 +2,7 @@
 dataset/
 output/*.tsv
 artifacts/
+artifacts_*/
 *.parquet
 
 # Environment / tooling
