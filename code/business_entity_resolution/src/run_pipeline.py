@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from src import blocking, config, decide, features, model, normalize
 from src.config import Paths
+from src.fulldata_lock import fulldata_lock
 from src.logging_utils import setup_logging, track_stage
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,7 @@ class Stage:
 
     Attributes:
         name: CLI stage name.
-        owner: Owning module and team member (from the plan).
+        owner: Owning module and lane.
         splits: Splits this stage runs for.
         outputs: Maps (paths, split) to the files/folders the stage produces;
             the stage is skipped when all of them exist.
@@ -192,7 +194,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         if value is not None:
             setattr(config, name, value)
         logger.info("config.%s = %s", name, getattr(config, name))
-    run(args.stage, args.split, paths, args.force)
+    command = "src.run_pipeline " + " ".join(sys.argv[1:] if argv is None else argv)
+    with fulldata_lock(paths.data_dir, command):
+        run(args.stage, args.split, paths, args.force)
 
 
 if __name__ == "__main__":
