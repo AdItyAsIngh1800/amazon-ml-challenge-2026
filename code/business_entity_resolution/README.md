@@ -35,6 +35,12 @@ python -m src.make_dev_sample --data-dir ../../dataset
 # Train split, then test split
 python -m src.run_pipeline --stage all --split train --data-dir ../../dataset --out-dir ../../output
 python -m src.run_pipeline --stage all --split test  --data-dir ../../dataset --out-dir ../../output
+
+# M1 rule baseline (no model): blocking's rrf_score replaces train/predict
+python -m src.run_pipeline --stage baseline --split train --data-dir ../../dataset --out-dir ../../output
+python -m src.run_pipeline --stage decide   --split train --data-dir ../../dataset --out-dir ../../output --decide-score-column score
+python -m src.run_pipeline --stage baseline --split test  --data-dir ../../dataset --out-dir ../../output
+python -m src.run_pipeline --stage write    --split test  --data-dir ../../dataset --out-dir ../../output
 ```
 
 ## Stages, runtime and peak RAM

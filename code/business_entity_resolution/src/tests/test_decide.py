@@ -179,3 +179,48 @@ def test_id_keys_rejects_malformed_ids() -> None:
     assert len(set(keys.tolist())) == 3
     with pytest.raises(ValueError, match="must match"):
         decide.id_keys(pa.array(["S2-5", "X-1"]))
+
+
+def _main(paths: Paths, stage: str, split: str, *extra: str) -> None:
+    """Run one stage through the CLI entry point."""
+    run_pipeline.main(["--stage", stage, "--split", split, "--data-dir", str(paths.data_dir),
+                       "--artifacts-dir", str(paths.artifacts_dir), "--out-dir", str(paths.output_dir), *extra])
+
+
+def _save_candidates(paths: Paths, split: str, rows: list[tuple[str, str, float]]) -> None:
+    """candidates_{split}.parquet with a synthetic rrf_score (Lane B's column)."""
+    df = pd.DataFrame(rows, columns=["s1_id", "cand_id", "rrf_score"]).astype({"rrf_score": np.float32})
+    io_utils.save_parquet(df, paths.artifacts_dir / f"candidates_{split}.parquet")
+
+
+def test_baseline_end_to_end(train_paths: Paths) -> None:
+    """baseline(train) -> decide(score) -> baseline(test) -> write -> validator PASS."""
+    paths = train_paths
+    _make_split(paths, "test", TEST)
+    _save_candidates(paths, "train", [(s1, c, p) for s1, c, p, _ in OOF])
+    _save_candidates(paths, "test", PRED)
+    try:
+        _main(paths, "baseline", "train", "--force")  # fixture already wrote a prob-based oof_train
+        oof = pd.read_parquet(paths.artifacts_dir / "oof_train.parquet")
+        assert oof["label"].tolist() == [lbl for *_, lbl in OOF]  # labels from the ground truth
+        assert (oof["score"].dtype, oof["label"].dtype, oof["fold"].dtype) == (np.float32, np.int8, np.int8)
+        _main(paths, "decide", "train", "--decide-score-column", "score")
+        _main(paths, "baseline", "test")
+        assert pd.read_parquet(paths.artifacts_dir / "pred_test.parquet").columns.tolist() == [
+            "s1_id", "cand_id", "score"]
+        _main(paths, "write", "test")  # raises unless validate_submission.py prints PASS
+    finally:
+        config.DECIDE_SCORE_COLUMN = "prob"
+    cfg = json.loads((paths.artifacts_dir / "decision_config.json").read_text(encoding="utf-8"))
+    assert cfg["score_column"] == "score" and cfg["train_f05"] == pytest.approx(_brute_force_best(True), abs=1e-6)
+    rows = (paths.output_dir / "candidate_pairs.tsv").read_text(encoding="utf-8").splitlines()
+    assert [r.split("\t")[0] for r in rows[1:]] == ["S1-10", "S1-11", "S1-12"]
+
+
+def test_baseline_without_rrf_score_names_lane_b(train_paths: Paths) -> None:
+    """A candidates file from blocking v0 (no rrf_score) fails with a clear message."""
+    df = pd.DataFrame([("S1-1", "S2-47", 0.9)], columns=["s1_id", "cand_id", "best_block_score"])
+    io_utils.save_parquet(df, train_paths.artifacts_dir / "candidates_train.parquet")
+    with pytest.raises(ValueError, match="rrf_score.*Lane B"):
+        decide.run_baseline(train_paths, "train")
+    assert not (train_paths.artifacts_dir / "oof_train.parquet.tmp").exists()

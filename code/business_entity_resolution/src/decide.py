@@ -1,4 +1,8 @@
-"""Stages `decide` (split=train) and `write` (split=test): decision layer and outputs.
+"""Stages `decide` (split=train), `write` (split=test) and `baseline` (both).
+
+baseline: candidates_{split}.parquet rrf_score -> oof_train.parquet (train, with
+        labels) / pred_test.parquet (test) with a "score" column: the M1 rule
+        baseline standing in for train/predict until the model exists.
 
 decide: <artifacts>/oof_train.parquet (s1_id, cand_id, <score col>, label) for ALL
         train pairs -> <artifacts>/decision_config.json. Optional global
@@ -46,6 +50,7 @@ OWNER = "decide.py (lane A, lead)"
 PAIR_BATCH_ROWS = 1_048_576  # = default parquet row-group size
 DECISION_CONFIG = "decision_config.json"
 ID_PATTERN = r"^S[1-3]-[0-9]{1,12}$"
+BASELINE_SOURCE_COLUMN = "rrf_score"  # candidates_{split} column added by blocking (Lane B)
 
 
 # --------------------------------------------------------------------------- data
@@ -428,6 +433,82 @@ def run_write(paths: Paths) -> None:
     for name, path in tmp.items():
         path.replace(paths.output_dir / name)
     logger.info("Wrote %s and %s", paths.output_dir / "matching_results.tsv", paths.output_dir / "candidate_pairs.tsv")
+
+
+def run_baseline(paths: Paths, split: str) -> None:
+    """M1 rule baseline: blocking's RRF score becomes the decision score (no model).
+
+    Streams candidates_{split}.parquet (``s1_id``, ``cand_id``, float
+    ``BASELINE_SOURCE_COLUMN``; one row per pair) PAIR_BATCH_ROWS rows at a
+    time and writes the file ``decide``/``write`` read with
+    ``--decide-score-column score``:
+
+    * train -> oof_train.parquet: s1_id, cand_id (str), fold (int8, -1 = no
+      CV), score (float32), label (int8, 1 if the pair is in the ground truth).
+    * test  -> pred_test.parquet: s1_id, cand_id (str), score (float32).
+
+    Memory: one batch of pairs plus, on train, the records ID index (~1 GB at
+    full scale) and one int64 key per true pair; independent of pair count.
+
+    Args:
+        paths: Run directories (reads artifacts candidates_{split}, and on
+            train records_train + the train ground truth).
+        split: ``"train"`` or ``"test"``.
+
+    Raises:
+        ValueError: If ``rrf_score`` (or another needed column) is missing, or
+            a ground-truth ID is not in records_train.
+    """
+    src = paths.artifacts_dir / f"candidates_{split}.parquet"
+    reader = pq.ParquetFile(src, pre_buffer=False, buffer_size=1 << 20)
+    if BASELINE_SOURCE_COLUMN not in reader.schema_arrow.names:
+        raise ValueError(f"{src} has no '{BASELINE_SOURCE_COLUMN}' column: Lane B's blocking PR that adds "
+                         f"{BASELINE_SOURCE_COLUMN} must be merged and the block stage rerun (--force)")
+    io_utils.require_columns(reader.schema_arrow.names, ["s1_id", "cand_id"], str(src))
+    train = split == "train"
+    fields = [pa.field("s1_id", pa.string()), pa.field("cand_id", pa.string())]
+    if train:
+        ids = load_split_ids(paths, "train")
+        n_cand = len(ids.cand)
+        gt = io_utils.read_ground_truth_pairs(paths.data_dir / "train" / "train_ground_truth.tsv")
+        gt = gt[gt["cand_id"] != ""]
+        s1c = encode(pa.array(gt["s1_id"]), ids.s1_keys, ids.s1_order, "ground-truth s1_id")
+        cc = encode(pa.array(gt["cand_id"]), ids.cand_keys, ids.cand_order, "ground-truth cand_id")
+        truth = np.sort(s1c.astype(np.int64) * n_cand + cc)
+        del gt, s1c, cc
+        fields.append(pa.field("fold", pa.int8()))
+    fields.append(pa.field("score", pa.float32()))
+    if train:
+        fields.append(pa.field("label", pa.int8()))
+    schema = pa.schema(fields)
+
+    out = paths.artifacts_dir / ("oof_train.parquet" if train else "pred_test.parquet")
+    tmp = out.with_name(out.name + ".tmp")
+    n = n_pos = 0
+    with pq.ParquetWriter(tmp, schema) as writer:
+        for b in reader.iter_batches(batch_size=PAIR_BATCH_ROWS, columns=["s1_id", "cand_id", BASELINE_SOURCE_COLUMN]):
+            cols: dict[str, pa.Array] = {"s1_id": pc.cast(b.column("s1_id"), pa.string()),
+                                         "cand_id": pc.cast(b.column("cand_id"), pa.string())}
+            if train:
+                key = (encode(b.column("s1_id"), ids.s1_keys, ids.s1_order, "candidates s1_id").astype(np.int64)
+                       * n_cand + encode(b.column("cand_id"), ids.cand_keys, ids.cand_order, "candidates cand_id"))
+                pos = np.minimum(np.searchsorted(truth, key), max(len(truth) - 1, 0))
+                label = (truth[pos] == key).astype(np.int8) if len(truth) else np.zeros(len(key), np.int8)
+                n_pos += int(label.sum())
+                cols["fold"] = pa.array(np.full(b.num_rows, -1, np.int8))
+            cols["score"] = pc.cast(b.column(BASELINE_SOURCE_COLUMN), pa.float32())
+            if train:
+                cols["label"] = pa.array(label)
+            writer.write_table(pa.table(cols, schema=schema))
+            n += b.num_rows
+            del b, cols
+            pa.default_memory_pool().release_unused()  # mimalloc keeps freed pages: 3.1 -> 2.6 GB peak at 60M pairs
+    tmp.replace(out)
+    if train:
+        logger.info("Baseline: %d train pairs, %d positive (%.1f%% of %d true pairs) -> %s",
+                    n, n_pos, 100 * n_pos / max(len(truth), 1), len(truth), out)
+    else:
+        logger.info("Baseline: %d test pairs -> %s", n, out)
 
 
 def run_stage(paths: Paths, split: str) -> None:
