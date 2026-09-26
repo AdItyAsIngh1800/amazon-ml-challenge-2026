@@ -46,8 +46,11 @@ from __future__ import annotations
 
 import gc
 import logging
+import multiprocessing
+import multiprocessing.pool
 import shutil
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -253,7 +256,11 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec, country: str
     """Top-K candidates per query row by cosine, without a full similarity matrix.
 
     Memory: one sparse product of at most ``BLOCK_MAX_PRODUCT_NNZ`` non-zeros
-    (or one row) plus ``rescore_k`` gathered pairs per row of that chunk.
+    (or one row) plus ``rescore_k`` gathered pairs per row of that chunk, per
+    worker. With ``config.BLOCK_WORKERS`` > 1 the S1 chunks run in a fork-based
+    process pool: workers inherit ``q``, ``c`` and their pruned/transposed
+    forms copy-on-write (read-only, never rebuilt per chunk), and results are
+    collected in chunk order, so the output is identical to the serial run.
 
     Args:
         q: L2-normalised query rows (S1), float32 CSR, shape (n_q, V).
@@ -277,35 +284,83 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec, country: str
     ct = c.T.tocsr()
     row_nnz = np.asarray(qp.astype(bool).astype(np.float64) @ df.astype(np.float64)).ravel()
     chunks = _chunk_bounds(row_nnz, BLOCK_MAX_PRODUCT_NNZ, config.BLOCK_CHUNK_S1_ROWS)
-    out: list[tuple[NDArray[np.int32], NDArray[np.int32], NDArray[np.float32], NDArray[np.int32]]] = []
+    out: list[_Chunk] = []
     max_nnz = 0
     every = max(1, len(chunks) // 20)  # progress line about every 5% of chunks
+    workers = min(config.BLOCK_WORKERS, len(chunks))
+    global _WORK
+    _WORK = _ChunkWork(q, c, qp, ct, top_k, rescore_k)
     start = time.perf_counter()
-    for i, (a, b) in enumerate(chunks, 1):
-        prod = (qp[a:b] @ ct).tocsr()
-        max_nnz = max(max_nnz, prod.nnz)
-        rows, cols = _best_per_row(prod, rescore_k)
-        del prod
-        if i % every == 0 or i == len(chunks):
-            elapsed = time.perf_counter() - start
-            logger.info("pass %s country %s: chunk %d/%d, elapsed %.0fs, ETA %.0fs", spec.name, country, i,
-                        len(chunks), elapsed, elapsed / i * (len(chunks) - i))
-        if not len(rows):
-            continue
-        rows += a
-        exact = np.asarray(q[rows].multiply(c[cols]).sum(axis=1), dtype=np.float32).ravel()
-        order = np.lexsort((cols, -exact, rows))
-        rows, cols, exact = rows[order], cols[order], exact[order]
-        starts = np.r_[0, np.flatnonzero(np.diff(rows)) + 1]
-        rank = np.arange(len(rows)) - np.repeat(starts, np.diff(np.r_[starts, len(rows)])) + 1
-        keep = (rank <= top_k) & (exact > 0)
-        out.append((rows[keep].astype(np.int32), cols[keep].astype(np.int32), exact[keep], rank[keep].astype(np.int32)))
+    pool: multiprocessing.pool.Pool | None = None
+    results: Iterator[tuple[_Chunk, int]]
+    try:
+        if workers > 1:
+            gc.freeze()  # keep the GC from touching (and so copying) inherited objects in the workers
+            pool = multiprocessing.get_context("fork").Pool(workers)
+            results = pool.imap(_chunk_top_k, chunks)  # imap yields in chunk order = serial order
+        else:
+            results = map(_chunk_top_k, chunks)
+        for i, (res, nnz) in enumerate(results, 1):
+            max_nnz = max(max_nnz, nnz)
+            if len(res[0]):
+                out.append(res)
+            if i % every == 0 or i == len(chunks):
+                elapsed = time.perf_counter() - start
+                logger.info("pass %s country %s: chunk %d/%d, elapsed %.0fs, ETA %.0fs (%d workers)", spec.name,
+                            country, i, len(chunks), elapsed, elapsed / i * (len(chunks) - i), workers)
+    finally:
+        if pool is not None:
+            pool.terminate()
+        gc.unfreeze()
+        _WORK = None
     logger.info("Pass %s: %d S1 x %d candidates, %d product chunks, max product nnz %.1fM, RSS %.2f GB",
                 spec.name, q.shape[0], c.shape[0], len(chunks), max_nnz / 1e6, psutil.Process().memory_info().rss / _GB)
     if not out:
         return empty
     qi, ci, sc, rk = (np.concatenate(x) for x in zip(*out, strict=True))
     return qi, ci, sc, rk
+
+
+_Chunk = tuple[NDArray[np.int32], NDArray[np.int32], NDArray[np.float32], NDArray[np.int32]]
+
+
+@dataclass(frozen=True)
+class _ChunkWork:
+    """Read-only inputs of ``_chunk_top_k``, set before the pool forks."""
+
+    q: sp.csr_matrix
+    c: sp.csr_matrix
+    qp: sp.csr_matrix
+    ct: sp.csr_matrix
+    top_k: int
+    rescore_k: int
+
+
+_WORK: _ChunkWork | None = None  # module global so forked workers inherit it without pickling
+
+
+def _chunk_top_k(bounds: tuple[int, int]) -> tuple[_Chunk, int]:
+    """Top-K of S1 rows ``[a, b)`` of ``_WORK`` (see ``top_k_pairs``) and the product nnz.
+
+    Runs in the parent (serial) or a forked worker; the same code either way.
+    """
+    w = _WORK
+    assert w is not None
+    a, b = bounds
+    prod = (w.qp[a:b] @ w.ct).tocsr()
+    nnz = int(prod.nnz)
+    rows, cols = _best_per_row(prod, w.rescore_k)
+    del prod
+    if not len(rows):
+        return (np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32), np.empty(0, np.int32)), nnz
+    rows += a
+    exact = np.asarray(w.q[rows].multiply(w.c[cols]).sum(axis=1), dtype=np.float32).ravel()
+    order = np.lexsort((cols, -exact, rows))
+    rows, cols, exact = rows[order], cols[order], exact[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(rows)) + 1]
+    rank = np.arange(len(rows)) - np.repeat(starts, np.diff(np.r_[starts, len(rows)])) + 1
+    keep = (rank <= w.top_k) & (exact > 0)
+    return (rows[keep].astype(np.int32), cols[keep].astype(np.int32), exact[keep], rank[keep].astype(np.int32)), nnz
 
 
 def _best_per_row(prod: sp.csr_matrix, k: int) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
@@ -546,6 +601,69 @@ def _capped_out_true(union: pd.DataFrame, truth: pd.DataFrame, cap: int, n_recor
     return out[np.isin(out["s1"].to_numpy() * n_records + out["cand"].to_numpy(), true_key)]
 
 
+def select_s1_fraction(strata: pd.Series, fraction: float) -> NDArray[np.bool_]:
+    """Deterministic stratified sample: keep ``round(fraction * n)`` rows of every stratum.
+
+    Args:
+        strata: Stratum label per S1 (e.g. "India|singleton"), in a fixed order.
+        fraction: Share to keep, in (0, 1].
+
+    Returns:
+        Boolean keep mask aligned with ``strata``; strata are visited in sorted
+        order with one ``config.SEED`` generator, so the result is reproducible.
+    """
+    keep = np.zeros(len(strata), dtype=bool)
+    rng = np.random.default_rng(config.SEED)
+    for _, idx in sorted(strata.groupby(strata, sort=True).indices.items()):
+        keep[rng.permutation(idx)[: int(round(fraction * len(idx)))]] = True
+    return keep
+
+
+def _subset_s1(rec: pd.DataFrame, truth: pd.DataFrame | None, split: str, out: Path) -> NDArray[np.bool_] | None:
+    """Apply ``config.BLOCK_S1_FRACTION``: pick the S1 to block, write their IDs to ``out``.
+
+    Args:
+        rec: ``_load_records`` output.
+        truth: ``_truth_index`` output (needed for the singleton strata).
+        split: Must be ``"train"`` when the fraction is below 1.
+        out: ``blocking_s1_subset_{split}.parquet`` (``s1_id`` str): the S1
+            that were blocked; decide.py restricts train S1 to it. Removed when
+            the fraction is 1 so a stale subset never outlives a full run.
+
+    Returns:
+        Keep mask over ``rec`` rows (True for every non-S1 row), or None when
+        the fraction is 1.
+
+    Raises:
+        ValueError: If the fraction is outside (0, 1], used on the test split,
+            or there is no ground truth to stratify by.
+    """
+    f = config.BLOCK_S1_FRACTION
+    if not 0.0 < f <= 1.0:
+        raise ValueError(f"BLOCK_S1_FRACTION must be in (0, 1], got {f}")
+    if f == 1.0:
+        out.unlink(missing_ok=True)
+        return None
+    if split != "train":
+        raise ValueError(f"BLOCK_S1_FRACTION={f} is train-only; the {split} split always blocks every S1")
+    if truth is None:
+        raise ValueError("BLOCK_S1_FRACTION < 1 needs the train ground truth for the singleton strata")
+    is_s1 = (rec["source"] == "S1").to_numpy()
+    s1_idx = np.flatnonzero(is_s1)
+    matched = np.isin(s1_idx, truth.loc[truth["cand"] >= 0, "s1"].to_numpy())
+    strata = rec["country"].to_numpy()[s1_idx] + np.where(matched, "|matched", "|singleton")
+    keep_s1 = select_s1_fraction(pd.Series(strata), f)
+    keep = ~is_s1
+    keep[s1_idx[keep_s1]] = True
+    pd.DataFrame({"s1_id": rec["entity_id"].to_numpy()[s1_idx[keep_s1]]}).to_parquet(out, index=False)
+    for st, n in pd.Series(strata).value_counts().sort_index().items():
+        logger.info("S1 fraction %.3f: stratum %s keeps %d of %d", f, st, int(keep_s1[strata == st].sum()), n)
+    logger.warning("S1 fraction %.3f: blocking %d of %d train S1; the other %d get no candidates and are "
+                   "excluded from training and decide (%s)", f, int(keep_s1.sum()), len(s1_idx),
+                   int((~keep_s1).sum()), out.name)
+    return keep
+
+
 def _write_part(union: pd.DataFrame, path: Path) -> None:
     """Spill capped union rows (index columns, pass columns) to a parquet part."""
     union.drop(columns="union_rank").to_parquet(path, index=False)
@@ -662,23 +780,30 @@ def run_stage(paths: Paths, split: str) -> None:
     capped_out: list[pd.DataFrame] = []
     cap = config.MAX_CANDIDATES_PER_S1
     n_records = len(rec)
+    keep = _subset_s1(rec, truth, split, art / f"blocking_s1_subset_{split}.parquet")
+    if keep is not None and truth is not None:
+        truth = truth[keep[truth["s1"].to_numpy()]].reset_index(drop=True)
 
     for country, grp in rec.groupby("country", sort=True):
         pos = grp.index.to_numpy()
         is_s1 = (grp["source"] == "S1").to_numpy()
-        s1_pos, cand_pos = pos[is_s1].astype(np.int32), pos[~is_s1].astype(np.int32)
+        if keep is not None:
+            is_s1 = is_s1 & keep[pos]  # unselected S1 are neither queries nor candidates
+        s1_pos = pos[is_s1].astype(np.int32)
+        cand_pos = pos[(grp["source"] != "S1").to_numpy()].astype(np.int32)
         logger.info("Country %s: %d S1, %d S2/S3", country, len(s1_pos), len(cand_pos))
         results = {p.name: run_pass(pass_text(grp, p), s1_pos, cand_pos, p, str(country)) for p in PASSES}
         gc.collect()
         for a in range(0, len(s1_pos), config.BLOCK_CHUNK_S1_ROWS):
-            lo, hi = int(s1_pos[a]), int(s1_pos[min(a + config.BLOCK_CHUNK_S1_ROWS, len(s1_pos)) - 1])
+            chunk_s1 = s1_pos[a: a + config.BLOCK_CHUNK_S1_ROWS]
+            lo, hi = int(chunk_s1[0]), int(chunk_s1[-1])
             sub = {}
             for n, r in results.items():
                 i, j = np.searchsorted(r.s1, lo), np.searchsorted(r.s1, hi, side="right")
                 sub[n] = PassResult(r.s1[i:j], r.cand[i:j], r.score[i:j], r.rank[i:j])
             union = union_passes(sub, n_records)
             if truth is not None:
-                _chunk_recall(report, str(country), union, np.arange(lo, hi + 1), truth, ids)
+                _chunk_recall(report, str(country), union, chunk_s1.astype(np.int64), truth, ids)
                 ts = truth["s1"].to_numpy()
                 part_truth = truth.iloc[np.searchsorted(ts, lo): np.searchsorted(ts, hi, side="right")]
                 capped_out.append(_capped_out_true(union, part_truth, cap, n_records))
@@ -690,7 +815,7 @@ def run_stage(paths: Paths, split: str) -> None:
 
     n_rows = _finalize(parts, rec, out)
     shutil.rmtree(parts_dir)
-    n_s1 = int((rec["source"] == "S1").sum())
+    n_s1 = int((rec["source"] == "S1").sum()) if keep is None else int(keep.sum() - (rec["source"] != "S1").sum())
     logger.info("Wrote %s: %d pairs, %.1f per S1 (cap %d)", out, n_rows, n_rows / max(n_s1, 1), cap)
     if truth is not None:
         _log_report(report, art / f"blocking_recall_{split}.tsv", split)

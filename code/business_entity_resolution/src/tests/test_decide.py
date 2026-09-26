@@ -462,3 +462,18 @@ def test_write_with_expected_f05_config(test_paths: Paths) -> None:
     decide.run_stage(test_paths, "test")
     m = (test_paths.output_dir / "matching_results.tsv").read_text(encoding="utf-8").splitlines()[1:]
     assert m == ["S1-10\tS2-1,S3-1", "S1-11\t", "S1-12\t"]
+
+
+def test_blocking_s1_subset_restricts_train_s1(tmp_path: Path) -> None:
+    """With blocking_s1_subset_train.parquet, decide sees only those S1 and their truth."""
+    paths = Paths(tmp_path / "d", tmp_path / "a", tmp_path / "o")
+    paths.artifacts_dir.mkdir(parents=True)
+    (paths.data_dir / "train").mkdir(parents=True)
+    pd.DataFrame({"entity_id": ["S1-1", "S1-2", "S2-1", "S2-2"], "source": ["S1", "S1", "S2", "S2"],
+                  "country": ["US"] * 4}).to_parquet(paths.artifacts_dir / "records_train.parquet", index=False)
+    (paths.data_dir / "train" / "train_ground_truth.tsv").write_text(
+        "source1_entity_id\tmatched_entity_ids\nS1-1\tS2-1\nS1-2\tS2-2\n", encoding="utf-8", newline="\n")
+    pd.DataFrame({"s1_id": ["S1-2"]}).to_parquet(paths.artifacts_dir / "blocking_s1_subset_train.parquet")
+    ids = decide.load_split_ids(paths, "train")
+    assert list(ids.s1) == ["S1-2"] and list(ids.cand) == ["S2-1", "S2-2"]
+    assert list(decide.truth_counts(paths.data_dir, ids)) == [1]

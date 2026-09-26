@@ -60,6 +60,8 @@ INDEX_DTYPE = np.int32
 BLOCK_CHUNK_S1_ROWS: int = 10_000
 BLOCK_TOP_K: int | None = None  # overrides every pass's K; None = each pass's own
 MAX_CANDIDATES_PER_S1: int = 50
+BLOCK_WORKERS: int = 1  # top-K S1 chunks run in a fork process pool when > 1; output identical to 1
+BLOCK_S1_FRACTION: float = 1.0  # train only: block a stratified (country x singleton) share of S1
 RECALL_K_VALUES: tuple[int, ...] = (5, 10, 20, 50)
 PASS_C_MIN_NAME_COSINE: float = 0.2
 

@@ -125,6 +125,10 @@ def load_split_ids(paths: Paths, split: str) -> SplitIds:
         paths: Run directories.
         split: ``"train"`` or ``"test"``.
 
+    On train, when blocking wrote ``blocking_s1_subset_train.parquet``
+    (``--block-s1-fraction`` < 1), only those S1 are kept: the others were
+    never blocked, so they are excluded from decide (logged).
+
     Returns:
         ``SplitIds`` (~1 GB for the full data: 12.5M IDs plus hash indexes).
 
@@ -134,8 +138,14 @@ def load_split_ids(paths: Paths, split: str) -> SplitIds:
     rec = io_utils.load_parquet(paths.artifacts_dir / f"records_{split}.parquet",
                                 columns=["entity_id", "source", "country"])
     is_s1 = (rec["source"] == "S1").to_numpy()
+    subset = paths.artifacts_dir / f"blocking_s1_subset_{split}.parquet"
+    if split == "train" and subset.exists():
+        n_all = int(is_s1.sum())
+        is_s1 = is_s1 & rec["entity_id"].isin(io_utils.load_parquet(subset, ["s1_id"])["s1_id"]).to_numpy()
+        logger.warning("%s: decide uses %d of %d train S1; %d unblocked S1 excluded",
+                       subset.name, int(is_s1.sum()), n_all, n_all - int(is_s1.sum()))
     s1 = pd.Index(rec.loc[is_s1, "entity_id"])
-    cand = pd.Index(rec.loc[~is_s1, "entity_id"])
+    cand = pd.Index(rec.loc[(rec["source"] != "S1").to_numpy(), "entity_id"])
     k1, k2 = id_keys(pa.array(s1)), id_keys(pa.array(cand))
     o1, o2 = np.argsort(k1, kind="stable"), np.argsort(k2, kind="stable")
     if (np.diff(k1[o1]) == 0).any() or (np.diff(k2[o2]) == 0).any():
@@ -572,11 +582,11 @@ def apply_rule(pairs: Pairs, ids: SplitIds, keep: NDArray[np.bool_], rule: Mappi
 def truth_counts(data_dir: Path, ids: SplitIds) -> NDArray[np.int64]:
     """True matches per S1 code from the ground truth (includes matches blocking missed).
 
-    Raises:
-        ValueError: If the ground truth references an S1 not in records_train.
+    Ground-truth rows of S1 not in ``ids`` (excluded by a blocking S1 subset)
+    are ignored.
     """
     gt = io_utils.read_ground_truth_pairs(data_dir / "train" / "train_ground_truth.tsv")
-    gt = gt[gt["cand_id"] != ""]
+    gt = gt[(gt["cand_id"] != "") & gt["s1_id"].isin(ids.s1)]  # isin: S1 outside a blocking subset
     codes = encode(pa.array(gt["s1_id"]), ids.s1_keys, ids.s1_order, "ground-truth s1_id")
     return np.bincount(codes, minlength=len(ids.s1)).astype(np.int64)
 
