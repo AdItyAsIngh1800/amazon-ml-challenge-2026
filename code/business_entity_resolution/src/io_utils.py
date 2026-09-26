@@ -275,3 +275,28 @@ def load_parquet(path: Path, columns: Sequence[str] | None = None) -> pd.DataFra
     df = pd.read_parquet(path, columns=None if columns is None else list(columns))
     logger.info("Loaded %s: %d rows x %d cols", path, len(df), df.shape[1])
     return df
+
+
+def blocked_s1_path(artifacts_dir: Path, split: str) -> Path:
+    """``blocking_s1_subset_{split}.parquet``: S1 blocked under ``--block-s1-fraction`` < 1."""
+    return artifacts_dir / f"blocking_s1_subset_{split}.parquet"
+
+
+def load_blocked_s1(artifacts_dir: Path, split: str) -> pd.Index | None:
+    """IDs of the S1 that blocking kept under ``--block-s1-fraction``, or None when every S1 was blocked.
+
+    Train-side reports (block recall, blocking_misses, decide/compare) use it
+    to ignore S1 that never got candidates.
+
+    Args:
+        artifacts_dir: Run artifacts folder.
+        split: ``"train"`` or ``"test"`` (test never has a subset).
+
+    Returns:
+        str Index of kept S1 IDs, or None if the subset file does not exist.
+    """
+    path = blocked_s1_path(artifacts_dir, split)
+    if not path.exists():
+        return None
+    ids: pd.Index = pd.Index(load_parquet(path, ["s1_id"])["s1_id"])
+    return ids

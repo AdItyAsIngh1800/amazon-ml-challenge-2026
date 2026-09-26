@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from src import blocking, config, contracts, normalize
+from src import blocking, config, contracts, io_utils, normalize
 from src.config import Paths
 
 SPEC = blocking.PassSpec("A", ("name_norm",), "char", 3, top_k=3, max_df=1.0, min_query_terms=1)
@@ -272,3 +272,21 @@ def test_s1_fraction_refused_on_test(tmp_path: Path, monkeypatch: pytest.MonkeyP
     from src import run_pipeline
     with pytest.raises(SystemExit):
         run_pipeline.main(["--stage", "block", "--split", "test", "--block-s1-fraction", "0.5"])
+
+
+def test_recall_report_ignores_unblocked_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                            caplog: pytest.LogCaptureFixture) -> None:
+    """With a fraction, the recall report counts only blocked S1 and their true pairs, and logs the exclusion."""
+    monkeypatch.setattr(config, "SHARED_ARTIFACTS_DIR", tmp_path / "shared")
+    monkeypatch.setattr(config, "BLOCK_S1_FRACTION", 0.5)
+    paths = _write_synthetic(tmp_path)
+    with caplog.at_level("WARNING"):
+        blocking.run_stage(paths, "train")
+    kept = io_utils.load_blocked_s1(paths.artifacts_dir, "train")
+    assert kept is not None and list(kept) == ["S1-2"]  # the one US|matched S1 the SEED picks
+    rep = pd.read_csv(paths.artifacts_dir / "blocking_recall_train.tsv", sep="\t")
+    union = rep[(rep["country"] == "ALL") & (rep["variant"] == "union")].iloc[0]
+    assert union["n_s1"] == 1 and union["n_true_pairs"] == 1  # S1-2 -> S2-2 only (full run: 4 S1, 4 pairs)
+    assert set(rep["country"]) == {"ALL", "US"}
+    assert any("the other 3 get no candidates" in r.getMessage() and "recall report" in r.getMessage()
+               for r in caplog.records)

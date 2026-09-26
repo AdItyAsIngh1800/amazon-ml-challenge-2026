@@ -659,7 +659,7 @@ def _subset_s1(rec: pd.DataFrame, truth: pd.DataFrame | None, split: str, out: P
     for st, n in pd.Series(strata).value_counts().sort_index().items():
         logger.info("S1 fraction %.3f: stratum %s keeps %d of %d", f, st, int(keep_s1[strata == st].sum()), n)
     logger.warning("S1 fraction %.3f: blocking %d of %d train S1; the other %d get no candidates and are "
-                   "excluded from training and decide (%s)", f, int(keep_s1.sum()), len(s1_idx),
+                   "excluded from training, decide and the recall report (%s)", f, int(keep_s1.sum()), len(s1_idx),
                    int((~keep_s1).sum()), out.name)
     return keep
 
@@ -780,7 +780,7 @@ def run_stage(paths: Paths, split: str) -> None:
     capped_out: list[pd.DataFrame] = []
     cap = config.MAX_CANDIDATES_PER_S1
     n_records = len(rec)
-    keep = _subset_s1(rec, truth, split, art / f"blocking_s1_subset_{split}.parquet")
+    keep = _subset_s1(rec, truth, split, io_utils.blocked_s1_path(art, split))
     if keep is not None and truth is not None:
         truth = truth[keep[truth["s1"].to_numpy()]].reset_index(drop=True)
 
@@ -820,7 +820,7 @@ def run_stage(paths: Paths, split: str) -> None:
     if truth is not None:
         _log_report(report, art / f"blocking_recall_{split}.tsv", split)
         co = pd.concat(capped_out, ignore_index=True) if capped_out else pd.DataFrame({"s1": [], "cand": []})
-        pd.DataFrame({"s1_id": ids.take(pa.array(co["s1"].to_numpy(np.int64))).to_numpy(zero_copy_only=False),
-                      "cand_id": ids.take(pa.array(co["cand"].to_numpy(np.int64))).to_numpy(zero_copy_only=False)},
-                     ).to_parquet(art / f"blocking_capped_out_{split}.parquet", index=False)
+        pq.write_table(pa.table({"s1_id": ids.take(pa.array(co["s1"].to_numpy(np.int64))),  # string even when empty
+                                 "cand_id": ids.take(pa.array(co["cand"].to_numpy(np.int64)))}),
+                       art / f"blocking_capped_out_{split}.parquet")
         logger.info("%d true pairs in the uncapped union were cut by the cap", len(co))

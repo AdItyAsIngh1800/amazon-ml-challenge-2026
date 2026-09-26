@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from src import blocking, blocking_misses, config, normalize
+from src import blocking, blocking_misses, config, io_utils, normalize
 from src.config import Paths
 
 ROWS = [
@@ -136,3 +136,25 @@ def test_missing_candidate_column_raises(tmp_path: Path) -> None:
         paths.artifacts_dir / "candidates_train.parquet", index=False)
     with pytest.raises(ValueError, match="cand_id"):
         blocking_misses.run(paths, n_examples=1)
+
+
+def test_misses_ignore_unblocked_s1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                    caplog: pytest.LogCaptureFixture) -> None:
+    """Under --block-s1-fraction, true pairs of unblocked S1 are not reported as misses; exclusion is logged."""
+    monkeypatch.setattr(config, "SHARED_ARTIFACTS_DIR", tmp_path / "shared")
+    monkeypatch.setattr(config, "MAX_CANDIDATES_PER_S1", 1)
+    monkeypatch.setattr(config, "BLOCK_S1_FRACTION", 0.5)
+    paths = _paths(tmp_path)
+    blocked = io_utils.load_blocked_s1(paths.artifacts_dir, "train")
+    assert blocked is not None
+    kept = set(blocked)
+    assert kept == {"S1-2", "S1-3"}  # US|matched keeps round(1.5) = 2 of 3, India|matched round(0.5) = 0
+    with caplog.at_level("WARNING"):
+        out = blocking_misses.run(paths, n_examples=2)
+    misses = pd.read_csv(out / "missed_pairs.tsv", sep="\t", dtype=str, keep_default_na=False)
+    cands = pd.read_parquet(paths.artifacts_dir / "candidates_train.parquet")
+    truth = {(s, c) for s, cs in [ln.split("\t") for ln in GT.splitlines()[1:]] for c in cs.split(",") if c and s in kept}
+    assert set(zip(misses["s1_id"], misses["cand_id"], strict=True)) == truth - set(zip(cands["s1_id"], cands["cand_id"]))
+    assert set(misses["s1_id"]) <= kept and len(misses)  # S1-3 -> S2-4 is still a miss
+    assert any("2 of 4 train S1 were blocked; 2 unblocked S1 and their 4 true pairs are excluded" in r.getMessage()
+               for r in caplog.records)

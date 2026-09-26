@@ -477,3 +477,18 @@ def test_blocking_s1_subset_restricts_train_s1(tmp_path: Path) -> None:
     ids = decide.load_split_ids(paths, "train")
     assert list(ids.s1) == ["S1-2"] and list(ids.cand) == ["S2-1", "S2-2"]
     assert list(decide.truth_counts(paths.data_dir, ids)) == [1]
+
+
+def test_compare_ignores_unblocked_s1(train_paths: Paths, caplog: pytest.LogCaptureFixture) -> None:
+    """With a blocking S1 subset, compare scores only the blocked S1 (here S1-1) and logs the exclusion."""
+    pd.DataFrame({"s1_id": ["S1-1"]}).to_parquet(io_utils.blocked_s1_path(train_paths.artifacts_dir, "train"))
+    oof = pd.read_parquet(train_paths.artifacts_dir / "oof_train.parquet")
+    io_utils.save_parquet(oof[oof["s1_id"] == "S1-1"], train_paths.artifacts_dir / "oof_train.parquet")
+    with caplog.at_level("WARNING"):
+        decide.run_compare(train_paths)  # not via _main: setup_logging would detach caplog
+    t = pd.read_csv(train_paths.artifacts_dir / "decide_compare.tsv", sep="\t").set_index("variant")
+    # S1-1 alone: best global threshold keeps S2-47 only -> P 1, R 0.5 -> F0.5 = 0.8333; per-source gets both -> 1.0
+    assert t.loc["threshold", "overall"] == pytest.approx(0.8333, abs=1e-4)
+    assert t.loc["per_source", "overall"] == pytest.approx(1.0)
+    assert "country=India" not in t.columns
+    assert any("using 1 of 3 train S1; 2 unblocked S1 excluded" in r.getMessage() for r in caplog.records)
