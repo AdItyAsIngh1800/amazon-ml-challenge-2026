@@ -184,6 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decide-score-column", choices=("prob", "score"), default=None,
                    help=f"decision input column: model 'prob' or rule-baseline 'score' "
                         f"(default {config.DECIDE_SCORE_COLUMN})")
+    p.add_argument("--decision-config", type=Path, default=None,
+                   help="write (test): apply this decision_config.json instead of <artifacts>/decision_config.json")
     for flag, name in CONFIG_OVERRIDES.items():
         p.add_argument(f"--{flag.replace('_', '-')}", type=int, default=None,
                        help=f"override config.{name} (default {getattr(config, name)})")
@@ -207,6 +209,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.decide_score_column is not None:
         config.DECIDE_SCORE_COLUMN = args.decide_score_column
     logger.info("config.DECIDE_SCORE_COLUMN = %s", config.DECIDE_SCORE_COLUMN)
+    if args.decision_config is not None:
+        config.DECISION_CONFIG_PATH = args.decision_config.resolve()
+        logger.info("config.DECISION_CONFIG_PATH = %s", config.DECISION_CONFIG_PATH)
     command = "src.run_pipeline " + " ".join(sys.argv[1:] if argv is None else argv)
     with fulldata_lock(paths.data_dir, command):
         run(args.stage, args.split, paths, args.force)

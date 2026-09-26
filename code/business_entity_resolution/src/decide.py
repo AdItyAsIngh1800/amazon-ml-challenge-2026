@@ -8,7 +8,8 @@ decide: <artifacts>/oof_train.parquet (s1_id, cand_id, <score col>, label) for A
         train pairs -> <artifacts>/decision_config.json. Optional global
         one-owner rule (each S2/S3 ID kept only for its highest-scoring S1),
         then per S1 keep score >= t, empty list if the S1's max score < t_empty.
-        t and t_empty are grid-searched for macro F0.5 over ALL train S1 at once.
+        t and t_empty are grid-searched for macro F0.5 over ALL train S1 at once;
+        the grid is config.DECIDE_GRID_QUANTILES quantiles of the score column.
 write:  <artifacts>/pred_test.parquet + decision_config.json (applied unchanged)
         -> <out>/matching_results.tsv and <out>/candidate_pairs.tsv, one row per
         test S1 (France included), then utils/validate_submission.py must PASS.
@@ -255,6 +256,30 @@ def per_s1_scores(pairs: Pairs, sel: NDArray[np.bool_], n_truth: NDArray[np.int6
     return evaluate.f05_from_counts(tp, n_pred, n_truth)
 
 
+def threshold_grid(scores: NDArray[np.float32], n_quantiles: int) -> tuple[float, ...]:
+    """Candidate thresholds: ``n_quantiles`` quantiles of the scores, deduplicated, ascending.
+
+    ``inverted_cdf`` quantiles are actual score values, so ``score >= t`` is exact
+    in float32 and the grid follows whatever range the score column has
+    (rrf_score ~0.017-0.18 or probabilities). Memory: one float32 copy of
+    ``scores`` for the partition.
+
+    Args:
+        scores: All candidate scores being decided on.
+        n_quantiles: Number of evenly spaced quantile levels in [0, 1].
+
+    Returns:
+        Sorted unique thresholds.
+
+    Raises:
+        ValueError: If ``scores`` is empty.
+    """
+    if len(scores) == 0:
+        raise ValueError("threshold_grid needs at least one score")
+    q = np.quantile(scores, np.linspace(0.0, 1.0, n_quantiles), method="inverted_cdf")
+    return tuple(float(v) for v in np.unique(q.astype(np.float32)))
+
+
 def grid_search(pairs: Pairs, keep: NDArray[np.bool_], n_truth: NDArray[np.int64],
                 t_grid: tuple[float, ...]) -> tuple[float, float, float]:
     """Best (t, t_empty, macro F0.5) over the grid; t_empty also tries 0 (no gate).
@@ -315,10 +340,13 @@ def run_decide(paths: Paths, log_row: bool = True) -> DecisionConfig:
     n_truth = truth_counts(paths.data_dir, ids)
     all_kept = np.ones(len(pairs.s1), dtype=bool)
     owner_kept = one_owner_mask(pairs, len(ids.cand))
-    results = {flag: grid_search(pairs, mask, n_truth, config.DECIDE_T_GRID)
+    grid = threshold_grid(pairs.score, config.DECIDE_GRID_QUANTILES)
+    logger.info("Threshold grid: %d values from %d quantiles of %s, %.4g .. %.4g",
+                len(grid), config.DECIDE_GRID_QUANTILES, score_col, grid[0], grid[-1])
+    results = {flag: grid_search(pairs, mask, n_truth, grid)
                for flag, mask in ((True, owner_kept), (False, all_kept))}
     for flag, (t, te, f) in results.items():
-        logger.info("Grid best with one_owner=%s: t=%.2f t_empty=%.2f macro F0.5=%.4f", flag, t, te, f)
+        logger.info("Grid best with one_owner=%s: t=%.6g t_empty=%.6g macro F0.5=%.4f", flag, t, te, f)
     one_owner = config.DECIDE_ONE_OWNER
     t, t_empty, f05 = results[one_owner]
     keep = owner_kept if one_owner else all_kept
@@ -333,7 +361,7 @@ def run_decide(paths: Paths, log_row: bool = True) -> DecisionConfig:
         seg = dict(zip(table["segment"], table["f05"], strict=True))
         other = results[not one_owner][2]
         log_experiment(
-            f"A-decide-{pd.Timestamp.now():%Y%m%d-%H%M%S}", "A", f"decide v0 grid ({score_col})",
+            f"A-decide-{pd.Timestamp.now():%Y%m%d-%H%M%S}", "A", f"decide v1 quantile grid ({score_col})",
             f05_overall=seg["overall"], f05_singleton=seg.get("singleton"),
             f05_non_singleton=seg.get("non_singleton"), f05_us=seg.get("country=US"),
             f05_india=seg.get("country=India"),
@@ -395,16 +423,23 @@ def _run_validator(matching: Path, candidates: Path, test_dir: Path) -> None:
 def run_write(paths: Paths) -> None:
     """Apply decision_config.json to test predictions and write both submission TSVs.
 
+    The config is ``config.DECISION_CONFIG_PATH`` if set (``--decision-config``,
+    e.g. tuned in another artifacts dir), else ``<artifacts>/decision_config.json``.
     Files are written as ``*.tmp``, validated, then renamed, so a failed
     validation never leaves outputs that the runner would skip on rerun.
 
     Raises:
+        FileNotFoundError: If the decision config file does not exist.
         ValueError: If decision_config.json lacks a contract key or inputs are malformed.
         RuntimeError: If the validator does not PASS.
     """
-    cfg_path = paths.artifacts_dir / DECISION_CONFIG
+    cfg_path = config.DECISION_CONFIG_PATH or paths.artifacts_dir / DECISION_CONFIG
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Decision config not found: {cfg_path}")
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     io_utils.require_columns(cfg.keys(), contracts.DECISION_CONFIG_KEYS, str(cfg_path))
+    logger.info("Using decision config %s (%s): %s", cfg_path.resolve(),
+                "--decision-config" if config.DECISION_CONFIG_PATH else "artifacts default", cfg)
     ids = load_split_ids(paths, "test")
     pairs = load_pairs(paths.artifacts_dir / "pred_test.parquet", cfg["score_column"], ids, with_label=False)
     keep = one_owner_mask(pairs, len(ids.cand)) if cfg["one_owner"] else np.ones(len(pairs.s1), dtype=bool)

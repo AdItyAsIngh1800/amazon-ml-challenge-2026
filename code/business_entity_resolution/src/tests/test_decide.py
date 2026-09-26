@@ -50,7 +50,7 @@ def train_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Paths:
 
 
 def _brute_force_best(one_owner: bool) -> float:
-    """Best macro F0.5 over the grid using evaluate.macro_f05 on plain sets."""
+    """Best macro F0.5 over every observed score as t / t_empty (exhaustive), via evaluate.macro_f05."""
     rows = OOF
     if one_owner:
         best_owner: dict[str, tuple[float, str]] = {}
@@ -59,8 +59,9 @@ def _brute_force_best(one_owner: bool) -> float:
                 best_owner[c] = (p, s1)
         rows = [r for r in rows if best_owner[r[1]][1] == r[0]]
     best = -1.0
-    for t in config.DECIDE_T_GRID:
-        for te in (0.0, *config.DECIDE_T_GRID):
+    grid = sorted({float(np.float32(p)) for _, _, p, _ in OOF})
+    for t in grid:
+        for te in (0.0, *grid):
             mx = {s1: max(p for s, _, p, _ in rows if s == s1) for s1, *_ in rows}
             pred = {s1: {c for s, c, p, _ in rows if s == s1 and p >= t} if mx[s1] >= te else set() for s1 in mx}
             best = max(best, evaluate.macro_f05(pred, TRUTH, list(TRUTH)))
@@ -83,6 +84,18 @@ def test_one_owner_keeps_best_s1() -> None:
     pairs = decide.Pairs(s1=np.array([0, 2, 1, 0], np.int32), cand=np.array([5, 5, 7, 7], np.int32),
                          score=np.array([0.8, 0.3, 0.6, 0.6], np.float32), label=None)
     assert decide.one_owner_mask(pairs, 8).tolist() == [True, False, False, True]
+
+
+def test_threshold_grid_adapts_to_score_range() -> None:
+    """Grid values are observed scores, deduplicated and ascending, for RRF-range and probability scores."""
+    rrf = np.array([0.017, 0.05, 0.05, 0.18, 0.033], np.float32)
+    grid = decide.threshold_grid(rrf, 200)
+    assert grid == tuple(sorted(float(v) for v in set(rrf.tolist())))
+    probs = np.linspace(0, 1, 10_001, dtype=np.float32)
+    grid = decide.threshold_grid(probs, 200)
+    assert len(grid) == 200 and grid[0] == 0.0 and grid[-1] == 1.0 and set(grid) <= set(probs.tolist())
+    with pytest.raises(ValueError):
+        decide.threshold_grid(np.array([], np.float32), 200)
 
 
 @pytest.mark.parametrize("one_owner", [True, False])
@@ -109,7 +122,7 @@ def test_decide_via_runner_with_baseline_score(train_paths: Paths) -> None:
     assert saved["score_column"] == "score"
     assert saved["train_f05"] == pytest.approx(_brute_force_best(True), abs=1e-6)
     log = (config.SHARED_ARTIFACTS_DIR / "experiments.tsv").read_text(encoding="utf-8").splitlines()
-    assert len(log) == 2 and "\tA\tdecide v0 grid (score)\t" in log[1]
+    assert len(log) == 2 and "\tA\tdecide v1 quantile grid (score)\t" in log[1]
 
 
 def test_bad_inputs_raise(train_paths: Paths) -> None:
@@ -194,7 +207,7 @@ def _save_candidates(paths: Paths, split: str, rows: list[tuple[str, str, float]
 
 
 def test_baseline_end_to_end(train_paths: Paths) -> None:
-    """baseline(train) -> decide(score) -> baseline(test) -> write -> validator PASS."""
+    """baseline(train) -> decide(score) -> baseline(test) -> write --decision-config -> validator PASS."""
     paths = train_paths
     _make_split(paths, "test", TEST)
     _save_candidates(paths, "train", [(s1, c, p) for s1, c, p, _ in OOF])
@@ -208,10 +221,17 @@ def test_baseline_end_to_end(train_paths: Paths) -> None:
         _main(paths, "baseline", "test")
         assert pd.read_parquet(paths.artifacts_dir / "pred_test.parquet").columns.tolist() == [
             "s1_id", "cand_id", "score"]
-        _main(paths, "write", "test")  # raises unless validate_submission.py prints PASS
+        # Config tuned "elsewhere": moved out of the artifacts dir and passed explicitly.
+        tuned = paths.data_dir.parent / "tuned" / "decision_config.json"
+        tuned.parent.mkdir()
+        (paths.artifacts_dir / "decision_config.json").rename(tuned)
+        with pytest.raises(FileNotFoundError, match="Decision config not found"):
+            _main(paths, "write", "test")
+        _main(paths, "write", "test", "--decision-config", str(tuned))  # raises unless validator prints PASS
     finally:
         config.DECIDE_SCORE_COLUMN = "prob"
-    cfg = json.loads((paths.artifacts_dir / "decision_config.json").read_text(encoding="utf-8"))
+        config.DECISION_CONFIG_PATH = None
+    cfg = json.loads(tuned.read_text(encoding="utf-8"))
     assert cfg["score_column"] == "score" and cfg["train_f05"] == pytest.approx(_brute_force_best(True), abs=1e-6)
     rows = (paths.output_dir / "candidate_pairs.tsv").read_text(encoding="utf-8").splitlines()
     assert [r.split("\t")[0] for r in rows[1:]] == ["S1-10", "S1-11", "S1-12"]

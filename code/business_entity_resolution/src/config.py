@@ -74,7 +74,12 @@ N_FOLDS: int = 5
 # model exists (run_pipeline --decide-score-column).
 DECIDE_SCORE_COLUMN: str = "prob"
 DECIDE_ONE_OWNER: bool = True  # EDA E3: 0 matched IDs shared between S1 lists
-DECIDE_T_GRID: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20))  # 0.05 .. 0.95
+# t / t_empty grid = this many quantiles of the decided score column, deduplicated
+# (adapts to rrf_score ~0.017-0.18 as well as to probabilities).
+DECIDE_GRID_QUANTILES: int = 200
+# write (test) reads this decision_config.json instead of <artifacts>/decision_config.json
+# when set (run_pipeline --decision-config), e.g. one tuned on another artifacts dir.
+DECISION_CONFIG_PATH: Path | None = None
 
 
 def _performance_cores() -> int:
