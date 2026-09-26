@@ -25,6 +25,8 @@ CANDIDATES_COLUMNS: tuple[str, ...] = (
 # plus "label" on the train split.
 FEATURES_KEY_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id")
 
+# oof_train / pred_test: until the model exists, the rule baseline may write a
+# "score" column instead of "prob" (config.DECIDE_SCORE_COLUMN selects it).
 OOF_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id", "fold", "prob", "label")
 PRED_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id", "prob")
-DECISION_CONFIG_KEYS: tuple[str, ...] = ("t", "t_empty", "one_owner")
+DECISION_CONFIG_KEYS: tuple[str, ...] = ("t", "t_empty", "one_owner", "score_column", "train_f05")
