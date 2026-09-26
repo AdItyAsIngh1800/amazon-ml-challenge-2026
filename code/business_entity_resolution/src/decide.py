@@ -749,14 +749,24 @@ class _SlicedIds(Mapping[str, list[str]]):
         return len(self._s1)
 
 
-def _run_validator(matching: Path, candidates: Path, test_dir: Path) -> None:
+def run_validator(matching: Path, candidates: Path, test_dir: Path, required: bool = False) -> None:
     """Run utils/validate_submission.py; raise unless it prints PASS.
 
+    Args:
+        matching: matching_results.tsv to check.
+        candidates: candidate_pairs.tsv to check.
+        test_dir: Folder with the test source TSVs.
+        required: Raise if the validator script is absent (else warn and skip,
+            e.g. when running from the submission zip).
+
     Raises:
+        FileNotFoundError: If ``required`` and the validator script is missing.
         RuntimeError: If the validator does not exit 0 with a PASS line.
     """
     script = config.REPO_ROOT / "utils" / "validate_submission.py"
     if not script.exists():
+        if required:
+            raise FileNotFoundError(f"Validator not found: {script}")
         logger.warning("Validator %s not found (e.g. running from the submission zip); skipping", script)
         return
     res = subprocess.run(
@@ -815,7 +825,7 @@ def run_write(paths: Paths) -> None:
         io_utils.write_id_list_tsv(mapping, s1_list, tmp[name], header)
     logger.info("Test: %d S1, %d candidate pairs, %d matches, %d S1 with empty match list",
                 len(s1_list), n_pairs, n_sel, n_empty)
-    _run_validator(tmp["matching_results.tsv"], tmp["candidate_pairs.tsv"], paths.data_dir / "test")
+    run_validator(tmp["matching_results.tsv"], tmp["candidate_pairs.tsv"], paths.data_dir / "test")
     for name, path in tmp.items():
         path.replace(paths.output_dir / name)
     logger.info("Wrote %s and %s", paths.output_dir / "matching_results.tsv", paths.output_dir / "candidate_pairs.tsv")

@@ -13,3 +13,7 @@ __pycache__/
 .DS_Store
 *.ipynb_checkpoints
 .claude/settings.local.json
+
+# Submission package (built by src.make_submission)
+*_submission.zip
+*_submission.zip.tmp
