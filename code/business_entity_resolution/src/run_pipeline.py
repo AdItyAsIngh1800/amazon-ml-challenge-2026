@@ -98,6 +98,7 @@ CONFIG_OVERRIDES: dict[str, str] = {
     "feature_chunk_pairs": "FEATURE_CHUNK_PAIRS",
     "lgbm_num_threads": "LGBM_NUM_THREADS",
     "rapidfuzz_workers": "RAPIDFUZZ_WORKERS",
+    "train_max_rows": "TRAIN_MAX_ROWS",
 }
 
 
