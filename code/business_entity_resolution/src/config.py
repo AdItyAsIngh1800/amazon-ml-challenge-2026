@@ -79,6 +79,16 @@ DECIDE_ONE_OWNER: bool = True  # EDA E3: 0 matched IDs shared between S1 lists
 # t / t_empty grid = this many quantiles of the decided score column, deduplicated
 # (adapts to rrf_score ~0.017-0.18 as well as to probabilities).
 DECIDE_GRID_QUANTILES: int = 200
+# Decision rule tuned by decide (run_pipeline --decide-method):
+#   "threshold"    one t for all candidates (+ t_empty gate)
+#   "per_source"   t_s2 / t_s3 by candidate ID prefix, coordinate descent from the global t
+#   "expected_f05" per S1, the probability-sorted prefix with the highest expected F0.5
+DECIDE_METHOD: str = "threshold"
+DECIDE_CD_ROUNDS: int = 5  # max coordinate-descent rounds for "per_source"
+# True: tune with and without the one-owner rule, keep the better (--decide-one-owner-auto).
+DECIDE_ONE_OWNER_AUTO: bool = False
+# Pairs per chunk in expected_f05 selection (chunks end on S1 boundaries).
+DECIDE_EXPECTED_CHUNK_PAIRS: int = 4_000_000
 # write (test) reads this decision_config.json instead of <artifacts>/decision_config.json
 # when set (run_pipeline --decision-config), e.g. one tuned on another artifacts dir.
 DECISION_CONFIG_PATH: Path | None = None

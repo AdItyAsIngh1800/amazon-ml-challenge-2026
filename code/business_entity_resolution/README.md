@@ -46,6 +46,12 @@ python -m src.run_pipeline --stage baseline --split test  --data-dir ../../datas
 python -m src.run_pipeline --stage write    --split test  --data-dir ../../dataset --out-dir ../../output
 # ...or apply a decision_config.json tuned elsewhere (e.g. on the dev sample)
 python -m src.run_pipeline --stage write    --split test  --data-dir ../../dataset --out-dir ../../output --decision-config /abs/path/decision_config.json
+
+# Decision variants: compare all on the same oof_train -> <artifacts>/decide_compare.tsv
+python -m src.run_pipeline --stage compare --split train --data-dir ../../dataset --out-dir ../../output
+# then tune the chosen one (threshold | per_source | expected_f05; optional auto one-owner)
+python -m src.run_pipeline --stage decide  --split train --data-dir ../../dataset --out-dir ../../output --force \
+    --decide-method expected_f05 --decide-one-owner-auto
 ```
 
 ## Stages, runtime and peak RAM

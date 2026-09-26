@@ -1,7 +1,7 @@
 """Single entry point for the entity-resolution pipeline.
 
 Usage (from code/business_entity_resolution/):
-    python -m src.run_pipeline --stage {prep,block,feat,train,predict,decide,write,baseline,all}
+    python -m src.run_pipeline --stage {prep,block,feat,train,predict,decide,write,baseline,compare,all}
         --split {train,test} --data-dir PATH --out-dir PATH
         [--artifacts-dir PATH] [--force] [--log-level INFO] [config overrides]
 
@@ -11,6 +11,8 @@ Full reproduction: ``--split train --stage all`` then ``--split test --stage all
 M1 rule baseline (not part of all): ``--stage baseline`` on either split writes
 oof_train / pred_test from blocking's rrf_score in place of train / predict;
 then decide with ``--decide-score-column score`` and write as usual.
+``--stage compare --split train`` tunes every decision variant on the same
+oof_train and writes decide_compare.tsv (overall / singleton / per-country F0.5).
 
 Each stage is skipped when all its outputs already exist (resume after a crash)
 unless ``--force``. Runtime and peak RSS are logged per stage. Stage artifacts
@@ -37,7 +39,7 @@ from src.logging_utils import setup_logging, track_stage
 logger = logging.getLogger(__name__)
 
 STAGE_ORDER: tuple[str, ...] = ("prep", "block", "feat", "train", "predict", "decide", "write")
-EXTRA_STAGES: tuple[str, ...] = ("baseline",)  # runnable by name only, never part of "all"
+EXTRA_STAGES: tuple[str, ...] = ("baseline", "compare")  # runnable by name only, never part of "all"
 RUN_META = "run_meta.json"
 
 
@@ -86,6 +88,8 @@ STAGES: dict[str, Stage] = {
         Stage("baseline", decide.OWNER, BOTH,
               lambda p, sp: [p.artifacts_dir / ("oof_train.parquet" if sp == "train" else "pred_test.parquet")],
               decide.run_baseline),
+        Stage("compare", decide.OWNER, ("train",),
+              lambda p, sp: [p.artifacts_dir / decide.COMPARE_FILE], decide.run_compare),
     )
 }
 
@@ -187,6 +191,10 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(default {config.DECIDE_SCORE_COLUMN})")
     p.add_argument("--decision-config", type=Path, default=None,
                    help="write (test): apply this decision_config.json instead of <artifacts>/decision_config.json")
+    p.add_argument("--decide-method", choices=decide.METHODS, default=None,
+                   help=f"decision rule tuned by decide (default {config.DECIDE_METHOD})")
+    p.add_argument("--decide-one-owner-auto", action="store_true",
+                   help="decide: keep whichever one-owner setting scores higher")
     for flag, name in CONFIG_OVERRIDES.items():
         p.add_argument(f"--{flag.replace('_', '-')}", type=int, default=None,
                        help=f"override config.{name} (default {getattr(config, name)})")
@@ -210,6 +218,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.decide_score_column is not None:
         config.DECIDE_SCORE_COLUMN = args.decide_score_column
     logger.info("config.DECIDE_SCORE_COLUMN = %s", config.DECIDE_SCORE_COLUMN)
+    if args.decide_method is not None:
+        config.DECIDE_METHOD = args.decide_method
+    if args.decide_one_owner_auto:
+        config.DECIDE_ONE_OWNER_AUTO = True
+    logger.info("config.DECIDE_METHOD = %s, DECIDE_ONE_OWNER_AUTO = %s", config.DECIDE_METHOD, config.DECIDE_ONE_OWNER_AUTO)
     if args.decision_config is not None:
         config.DECISION_CONFIG_PATH = args.decision_config.resolve()
         logger.info("config.DECISION_CONFIG_PATH = %s", config.DECISION_CONFIG_PATH)

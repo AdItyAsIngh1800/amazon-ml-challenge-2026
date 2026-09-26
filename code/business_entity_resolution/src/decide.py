@@ -1,4 +1,4 @@
-"""Stages `decide` (split=train), `write` (split=test) and `baseline` (both).
+"""Stages `decide` (split=train), `write` (split=test), `baseline` (both), `compare` (train).
 
 baseline: candidates_{split}.parquet rrf_score -> oof_train.parquet (train, with
         labels) / pred_test.parquet (test) with a "score" column: the M1 rule
@@ -10,6 +10,12 @@ decide: <artifacts>/oof_train.parquet (s1_id, cand_id, <score col>, label) for A
         then per S1 keep score >= t, empty list if the S1's max score < t_empty.
         t and t_empty are grid-searched for macro F0.5 over ALL train S1 at once;
         the grid is config.DECIDE_GRID_QUANTILES quantiles of the score column.
+        config.DECIDE_METHOD swaps the rule: "per_source" (t_s2 / t_s3 by ID
+        prefix, coordinate descent) or "expected_f05" (per-S1 expected-F0.5
+        prefix of probability-sorted candidates). config.DECIDE_ONE_OWNER_AUTO
+        keeps whichever one-owner setting scores higher.
+compare: every method x one-owner on/off on the same oof_train.parquet
+        -> <artifacts>/decide_compare.tsv (+ logged table), per-segment F0.5.
 write:  <artifacts>/pred_test.parquet + decision_config.json (applied unchanged)
         -> <out>/matching_results.tsv and <out>/candidate_pairs.tsv, one row per
         test S1 (France included), then utils/validate_submission.py must PASS.
@@ -21,7 +27,9 @@ Memory: pairs are held as int32 S1/candidate indices + float32 scores (+ int8
 labels), ~13 bytes per pair (~1.4 GB for 110M pairs), preallocated and filled
 from parquet in PAIR_BATCH_ROWS batches using only the needed columns. The
 one-owner rule uses ufunc.at (no sort); write groups by S1 with one stable
-argsort (+8 bytes per pair transient).
+argsort (+8 bytes per pair transient). Threshold search sorts the kept pairs by
+score once (~25 bytes per pair transient, 9 retained) and sweeps the grid
+incrementally; expected_f05 lexsorts kept pairs by (S1, -score).
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ from numpy.typing import NDArray
 from src import config, contracts, evaluate, io_utils
 from src.config import Paths
 from src.experiment_log import log_experiment
+from src.logging_utils import track_stage
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +61,8 @@ PAIR_BATCH_ROWS = 1_048_576  # = default parquet row-group size
 DECISION_CONFIG = "decision_config.json"
 ID_PATTERN = r"^S[1-3]-[0-9]{1,12}$"
 BASELINE_SOURCE_COLUMN = "rrf_score"  # candidates_{split} column added by blocking (Lane B)
+METHODS: tuple[str, ...] = ("threshold", "per_source", "expected_f05")
+COMPARE_FILE = "decide_compare.tsv"
 
 
 # --------------------------------------------------------------------------- data
@@ -241,8 +252,12 @@ def max_score_per_s1(pairs: Pairs, keep: NDArray[np.bool_], n_s1: int) -> NDArra
     return out
 
 
-def select(pairs: Pairs, keep: NDArray[np.bool_], max_s1: NDArray[np.float32], t: float, t_empty: float) -> NDArray[np.bool_]:
-    """Pairs predicted as matches: kept, score >= t, and the S1's max score >= t_empty."""
+def select(pairs: Pairs, keep: NDArray[np.bool_], max_s1: NDArray[np.float32],
+           t: float | NDArray[np.float32], t_empty: float) -> NDArray[np.bool_]:
+    """Pairs predicted as matches: kept, score >= t, and the S1's max score >= t_empty.
+
+    ``t`` is one threshold or one per pair (per-source rule).
+    """
     return keep & (pairs.score >= t) & (max_s1[pairs.s1] >= t_empty)
 
 
@@ -280,29 +295,271 @@ def threshold_grid(scores: NDArray[np.float32], n_quantiles: int) -> tuple[float
     return tuple(float(v) for v in np.unique(q.astype(np.float32)))
 
 
+@dataclass(frozen=True)
+class _Desc:
+    """Labelled pairs of one group sorted by descending score, so ``score >= t`` is a prefix.
+
+    Attributes:
+        s1: int32 S1 codes. neg: float32 ``-score`` (ascending). label: int8 labels.
+    """
+
+    s1: NDArray[np.int32]
+    neg: NDArray[np.float32]
+    label: NDArray[np.int8]
+
+    def n_above(self, t: float) -> int:
+        """Number of pairs with score >= t."""
+        return int(np.searchsorted(self.neg, np.float32(-t), side="right"))
+
+    def counts(self, t: float, n: int) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+        """(true positives, predictions) per S1 when keeping score >= t."""
+        end = self.n_above(t)
+        s = self.s1[:end]
+        return np.bincount(s[self.label[:end] == 1], minlength=n), np.bincount(s, minlength=n)
+
+
+def _sort_desc(pairs: Pairs, mask: NDArray[np.bool_]) -> _Desc:
+    """Masked labelled pairs sorted by descending score (stable).
+
+    Memory: ~25 bytes per masked pair transient, 9 retained.
+    """
+    if pairs.label is None:
+        raise ValueError("threshold search needs labelled pairs")
+    idx = np.flatnonzero(mask)
+    idx = idx[np.argsort(-pairs.score[idx], kind="stable")]
+    return _Desc(s1=pairs.s1[idx], neg=-pairs.score[idx], label=pairs.label[idx])
+
+
+class _Gate:
+    """Best t_empty for given per-S1 counts in O(n_s1): no per-t_empty rescoring.
+
+    An S1 is open (keeps its selection) iff its max kept score >= t_empty, else
+    it predicts empty (F0.5 = 1 iff it is a singleton). With S1 sorted by max
+    score, macro F0.5 at every t_empty is a suffix sum of (open - closed) gains.
+    """
+
+    def __init__(self, max_s1: NDArray[np.float32], n_truth: NDArray[np.int64], te_grid: tuple[float, ...]) -> None:
+        """Sort S1 by max kept score once; ``te_grid`` is tried with 0.0 (no gate) prepended."""
+        self.order = np.argsort(max_s1, kind="stable")
+        self.n_truth = n_truth
+        self.closed = (n_truth == 0).astype(np.float64)
+        self.te = np.array((0.0, *te_grid), dtype=np.float32)
+        # first S1 (in max order) passing each t_empty
+        self.first_open = np.searchsorted(max_s1[self.order], self.te, side="left")
+
+    def best(self, tp: NDArray[np.int64], n_pred: NDArray[np.int64]) -> tuple[float, float]:
+        """(t_empty, macro F0.5) maximising F0.5; the lowest t_empty wins ties."""
+        gain = evaluate.f05_from_counts(tp, n_pred, self.n_truth)[self.order] - self.closed[self.order]
+        suffix = np.concatenate((np.cumsum(gain[::-1])[::-1], [0.0]))
+        f = (self.closed.sum() + suffix[self.first_open]) / len(self.n_truth)
+        i = int(np.argmax(f))
+        return float(self.te[i]), float(f[i])
+
+
+def _sweep(group: _Desc, grid: tuple[float, ...], base_tp: NDArray[np.int64], base_pred: NDArray[np.int64],
+           gate: _Gate) -> tuple[float, float, float]:
+    """Best (t, t_empty, macro F0.5) for ``group``'s threshold, other counts fixed at ``base_*``.
+
+    Walks t from high to low adding each newly passing slice of the sorted
+    group, so the whole grid costs one pass over the group plus O(n_s1) per t.
+    The lowest (t, t_empty) wins ties (same as scanning ascending with ``>``).
+    """
+    n = len(base_tp)
+    tp, n_pred = base_tp.copy(), base_pred.copy()
+    prev = 0
+    best = (grid[0], 0.0, -1.0)
+    for t in reversed(grid):
+        end = group.n_above(t)
+        s = group.s1[prev:end]
+        n_pred += np.bincount(s, minlength=n)
+        tp += np.bincount(s[group.label[prev:end] == 1], minlength=n)
+        prev = end
+        te, f = gate.best(tp, n_pred)
+        if f >= best[2]:
+            best = (t, te, f)
+    return best
+
+
 def grid_search(pairs: Pairs, keep: NDArray[np.bool_], n_truth: NDArray[np.int64],
                 t_grid: tuple[float, ...]) -> tuple[float, float, float]:
     """Best (t, t_empty, macro F0.5) over the grid; t_empty also tries 0 (no gate).
 
-    One pass over the pairs per t; each t_empty is O(n_s1). The first best
-    in ascending (t, t_empty) order wins ties.
+    Sorts the kept pairs by score once, then one incremental sweep: O(n log n)
+    + O(len(grid) * n_s1). The first best in ascending (t, t_empty) order wins ties.
     """
-    if pairs.label is None:
-        raise ValueError("grid_search needs labelled pairs")
     n = len(n_truth)
-    max_s1 = max_score_per_s1(pairs, keep, n)
-    keep_true = keep & (pairs.label == 1)
-    best = (t_grid[0], 0.0, -1.0)
-    for t in t_grid:
-        above = pairs.score >= t
-        n_pred = np.bincount(pairs.s1[keep & above], minlength=n)
-        tp = np.bincount(pairs.s1[keep_true & above], minlength=n)
-        for t_empty in (0.0, *t_grid):
-            gate = max_s1 >= t_empty
-            f = float(evaluate.f05_from_counts(np.where(gate, tp, 0), np.where(gate, n_pred, 0), n_truth).mean())
-            if f > best[2]:
-                best = (t, t_empty, f)
-    return best
+    gate = _Gate(max_score_per_s1(pairs, keep, n), n_truth, t_grid)
+    zeros = np.zeros(n, dtype=np.int64)
+    return _sweep(_sort_desc(pairs, keep), t_grid, zeros, zeros, gate)
+
+
+def cand_is_s3(ids: SplitIds) -> NDArray[np.bool_]:
+    """True per candidate code whose ID starts with ``S3-`` (source from the ID prefix)."""
+    out = np.zeros(len(ids.cand), dtype=bool)
+    out[ids.cand_order] = ids.cand_keys // 10**12 == 3
+    return out
+
+
+def per_source_search(pairs: Pairs, keep: NDArray[np.bool_], is_s3: NDArray[np.bool_], n_truth: NDArray[np.int64],
+                      t_grid: tuple[float, ...], start: tuple[float, float, float]) -> tuple[float, float, float, float]:
+    """Best (t_s2, t_s3, t_empty, macro F0.5) by coordinate descent from the global optimum.
+
+    Starting at t_s2 = t_s3 = ``start``'s t, alternately re-sweeps the S2 and
+    the S3 threshold (each with t_empty) with the other held fixed, accepting
+    only strict improvements, for up to config.DECIDE_CD_ROUNDS rounds. The
+    result is never worse than ``start``. Each sweep is one pass over that
+    source's pairs + O(len(grid) * n_s1).
+
+    Args:
+        pairs: Labelled pairs.
+        keep: Pairs eligible (e.g. one-owner mask).
+        is_s3: Per pair, True if the candidate is an S3 record.
+        n_truth: True matches per S1.
+        t_grid: Threshold grid (also used for t_empty).
+        start: (t, t_empty, F0.5) from ``grid_search`` on the same ``keep``.
+
+    Returns:
+        (t_s2, t_s3, t_empty, macro F0.5).
+    """
+    n = len(n_truth)
+    gate = _Gate(max_score_per_s1(pairs, keep, n), n_truth, t_grid)
+    groups = {2: _sort_desc(pairs, keep & ~is_s3), 3: _sort_desc(pairs, keep & is_s3)}
+    t = {2: start[0], 3: start[0]}
+    te, f = start[1], start[2]
+    for rnd in range(config.DECIDE_CD_ROUNDS):
+        improved = False
+        for src, other in ((2, 3), (3, 2)):
+            base_tp, base_pred = groups[other].counts(t[other], n)
+            t_new, te_new, f_new = _sweep(groups[src], t_grid, base_tp, base_pred, gate)
+            if f_new > f + 1e-12:
+                t[src], te, f, improved = t_new, te_new, f_new, True
+        logger.info("Per-source round %d: t_s2=%.6g t_s3=%.6g t_empty=%.6g F0.5=%.4f", rnd + 1, t[2], t[3], te, f)
+        if not improved:
+            break
+    return t[2], t[3], te, f
+
+
+def expected_f05_select(pairs: Pairs, keep: NDArray[np.bool_], n_s1: int) -> NDArray[np.bool_]:
+    """Per S1, the probability-sorted prefix of kept candidates with the highest expected F0.5.
+
+    Treating probabilities as independent calibrated Bernoullis, predicting
+    nothing scores P(no match) = prod(1 - p); the top-k prefix scores
+    1.25 * sum_{i<=k} p_i / (0.25 * sum_all p + k). The empty set wins ties.
+
+    Memory: a lexsort of the kept pairs (~20 bytes per kept pair) plus
+    float64 work arrays for config.DECIDE_EXPECTED_CHUNK_PAIRS pairs at a time
+    (chunks end on S1 boundaries).
+
+    Args:
+        pairs: Pairs whose ``score`` is a probability in [0, 1].
+        keep: Pairs eligible (e.g. one-owner mask).
+        n_s1: Number of S1 codes (unused beyond validation of codes).
+
+    Returns:
+        Boolean selection mask over pairs.
+    """
+    # ponytail: ratio-of-expectations approximation and truths outside the candidates
+    # ignored; an exact Poisson-binomial DP (O(m^2) per S1) if calibration proves good.
+    sel = np.zeros(len(pairs.s1), dtype=bool)
+    idx = np.flatnonzero(keep)
+    if not len(idx):
+        return sel
+    idx = idx[np.lexsort((-pairs.score[idx], pairs.s1[idx]))]
+    s1 = pairs.s1[idx]
+    if s1[-1] >= n_s1:
+        raise ValueError("S1 code out of range")
+    starts = np.flatnonzero(np.concatenate(([True], s1[1:] != s1[:-1])))
+    bounds = np.append(starts, len(idx))
+    step = max(1, config.DECIDE_EXPECTED_CHUNK_PAIRS)
+    g0 = 0
+    while g0 < len(starts):
+        g1 = max(g0 + 1, int(np.searchsorted(bounds, bounds[g0] + step, side="right")) - 1)
+        g1 = min(g1, len(starts))
+        lo, hi = int(bounds[g0]), int(bounds[g1])
+        p = np.clip(pairs.score[idx[lo:hi]].astype(np.float64), 0.0, 1.0)
+        local = bounds[g0:g1] - lo
+        grp = np.repeat(np.arange(g1 - g0), np.diff(np.append(local, hi - lo)))
+        csum = np.cumsum(p)
+        offset = csum[local] - p[local]
+        cum = csum - offset[grp]
+        total = np.add.reduceat(p, local)
+        k = np.arange(hi - lo) - local[grp] + 1
+        exp_f = 1.25 * cum / (0.25 * total[grp] + k)
+        best = np.maximum.reduceat(exp_f, local)
+        k_best = np.minimum.reduceat(np.where(exp_f == best[grp], k, np.iinfo(np.int64).max), local)
+        p_empty = np.exp(np.add.reduceat(np.log1p(-np.minimum(p, 1.0 - 1e-12)), local))
+        take = (best > p_empty)[grp] & (k <= k_best[grp])
+        sel[idx[lo:hi][take]] = True
+        g0 = g1
+    logger.info("Expected-F0.5 selection keeps %d of %d kept pairs", int(sel.sum()), len(idx))
+    return sel
+
+
+def calibration_table(prob: NDArray[np.float32], label: NDArray[np.int8], n_bins: int = 10) -> pd.DataFrame:
+    """Reliability table: pairs in equal-width probability bins (deciles of [0, 1]), logged.
+
+    Args:
+        prob: Predicted probabilities, one per pair.
+        label: 1 for a true pair.
+        n_bins: Number of equal-width bins.
+
+    Returns:
+        DataFrame, one row per non-empty bin: ``bin`` (str), ``n`` (int),
+        ``mean_prob``, ``pos_rate`` (float). Also logs the expected calibration error.
+    """
+    b = np.minimum((np.clip(prob, 0.0, 1.0) * n_bins).astype(np.int64), n_bins - 1)
+    n = np.bincount(b, minlength=n_bins)
+    mean_p = np.bincount(b, weights=prob.astype(np.float64), minlength=n_bins) / np.maximum(n, 1)
+    rate = np.bincount(b, weights=label.astype(np.float64), minlength=n_bins) / np.maximum(n, 1)
+    table = pd.DataFrame({"bin": [f"[{i / n_bins:.1f},{(i + 1) / n_bins:.1f})" for i in range(n_bins)],
+                          "n": n, "mean_prob": mean_p, "pos_rate": rate})[n > 0].reset_index(drop=True)
+    for r in table.itertuples():
+        logger.info("Calibration %s n=%-10d mean_prob=%.4f pos_rate=%.4f", r.bin, r.n, r.mean_prob, r.pos_rate)
+    ece = float((table["n"] * (table["mean_prob"] - table["pos_rate"]).abs()).sum() / max(len(prob), 1))
+    logger.info("Calibration: expected calibration error %.4f over %d pairs", ece, len(prob))
+    return table
+
+
+def tune(pairs: Pairs, ids: SplitIds, keep: NDArray[np.bool_], n_truth: NDArray[np.int64], method: str,
+         grid: tuple[float, ...]) -> dict[str, float]:
+    """Tune one decision method on labelled pairs.
+
+    Returns:
+        Rule parameters (``t``, ``t_empty``, plus ``t_s2`` / ``t_s3`` for
+        per_source) and ``f05`` (train macro F0.5).
+
+    Raises:
+        ValueError: On an unknown method.
+    """
+    if method == "expected_f05":
+        sel = expected_f05_select(pairs, keep, len(n_truth))
+        return {"t": 0.0, "t_empty": 0.0, "f05": float(per_s1_scores(pairs, sel, n_truth).mean())}
+    if method not in METHODS:
+        raise ValueError(f"Unknown decision method {method!r}; expected one of {METHODS}")
+    t, te, f = grid_search(pairs, keep, n_truth, grid)
+    if method == "threshold":
+        return {"t": t, "t_empty": te, "f05": f}
+    is_s3 = cand_is_s3(ids)[pairs.cand]
+    t2, t3, te2, f2 = per_source_search(pairs, keep, is_s3, n_truth, grid, (t, te, f))
+    return {"t": t, "t_empty": te2, "t_s2": t2, "t_s3": t3, "f05": f2}
+
+
+def apply_rule(pairs: Pairs, ids: SplitIds, keep: NDArray[np.bool_], rule: Mapping[str, object]) -> NDArray[np.bool_]:
+    """Selection mask for a tuned rule (a decision_config dict or ``tune`` output).
+
+    Raises:
+        ValueError: On an unknown method.
+    """
+    method = str(rule.get("method", "threshold"))
+    if method == "expected_f05":
+        return expected_f05_select(pairs, keep, len(ids.s1))
+    if method not in METHODS:
+        raise ValueError(f"Unknown decision method {method!r}; expected one of {METHODS}")
+    t: float | NDArray[np.float32] = float(rule["t"])  # type: ignore[arg-type]  # JSON value
+    if method == "per_source":
+        t = np.where(cand_is_s3(ids)[pairs.cand], np.float32(rule["t_s3"]), np.float32(rule["t_s2"]))  # type: ignore[arg-type]
+    t_empty = float(rule["t_empty"])  # type: ignore[arg-type]
+    return select(pairs, keep, max_score_per_s1(pairs, keep, len(ids.s1)), t, t_empty)
 
 
 def truth_counts(data_dir: Path, ids: SplitIds) -> NDArray[np.int64]:
@@ -320,8 +577,41 @@ def truth_counts(data_dir: Path, ids: SplitIds) -> NDArray[np.int64]:
 # --------------------------------------------------------------------------- stages
 
 
+def _load_train(paths: Paths) -> tuple[SplitIds, Pairs, NDArray[np.int64]]:
+    """Train IDs, labelled OOF pairs (config.DECIDE_SCORE_COLUMN) and true-match counts per S1."""
+    ids = load_split_ids(paths, "train")
+    pairs = load_pairs(paths.artifacts_dir / "oof_train.parquet", config.DECIDE_SCORE_COLUMN, ids, with_label=True)
+    return ids, pairs, truth_counts(paths.data_dir, ids)
+
+
+def _grid(pairs: Pairs) -> tuple[float, ...]:
+    """Quantile threshold grid of the decided score column, logged."""
+    grid = threshold_grid(pairs.score, config.DECIDE_GRID_QUANTILES)
+    logger.info("Threshold grid: %d values from %d quantiles of %s, %.4g .. %.4g",
+                len(grid), config.DECIDE_GRID_QUANTILES, config.DECIDE_SCORE_COLUMN, grid[0], grid[-1])
+    return grid
+
+
+def _check_method(method: str, score_col: str) -> None:
+    """expected_f05 needs probabilities.
+
+    Raises:
+        ValueError: On an unknown method or expected_f05 on a non-probability score.
+    """
+    if method not in METHODS:
+        raise ValueError(f"Unknown decision method {method!r}; expected one of {METHODS}")
+    if method == "expected_f05" and score_col != "prob":
+        raise ValueError("DECIDE_METHOD=expected_f05 needs probabilities (--decide-score-column prob)")
+
+
 def run_decide(paths: Paths, log_row: bool = True) -> DecisionConfig:
-    """Tune t / t_empty on all train pairs, report segments, save decision_config.json.
+    """Tune the decision rule on all train pairs, report segments, save decision_config.json.
+
+    The rule is config.DECIDE_METHOD, tuned with and without the one-owner rule;
+    config.DECIDE_ONE_OWNER picks one, or with config.DECIDE_ONE_OWNER_AUTO the
+    better one (ties keep one-owner), recorded as ``one_owner_auto`` and
+    ``f05_by_one_owner``. Non-default methods add ``method`` (and ``t_s2`` /
+    ``t_s3``) to decision_config.json; the default output is unchanged.
 
     Args:
         paths: Run directories (reads artifacts records_train + oof_train and the
@@ -329,46 +619,107 @@ def run_decide(paths: Paths, log_row: bool = True) -> DecisionConfig:
         log_row: Append the result to the experiment log.
 
     Returns:
-        The saved ``DecisionConfig``.
+        The saved ``DecisionConfig`` (required keys only).
 
     Raises:
-        ValueError: On missing columns, unknown IDs or an unlabelled input.
+        ValueError: On missing columns, unknown IDs, an unlabelled input or an
+            invalid method.
     """
-    score_col = config.DECIDE_SCORE_COLUMN
-    ids = load_split_ids(paths, "train")
-    pairs = load_pairs(paths.artifacts_dir / "oof_train.parquet", score_col, ids, with_label=True)
-    n_truth = truth_counts(paths.data_dir, ids)
-    all_kept = np.ones(len(pairs.s1), dtype=bool)
-    owner_kept = one_owner_mask(pairs, len(ids.cand))
-    grid = threshold_grid(pairs.score, config.DECIDE_GRID_QUANTILES)
-    logger.info("Threshold grid: %d values from %d quantiles of %s, %.4g .. %.4g",
-                len(grid), config.DECIDE_GRID_QUANTILES, score_col, grid[0], grid[-1])
-    results = {flag: grid_search(pairs, mask, n_truth, grid)
-               for flag, mask in ((True, owner_kept), (False, all_kept))}
-    for flag, (t, te, f) in results.items():
-        logger.info("Grid best with one_owner=%s: t=%.6g t_empty=%.6g macro F0.5=%.4f", flag, t, te, f)
-    one_owner = config.DECIDE_ONE_OWNER
-    t, t_empty, f05 = results[one_owner]
-    keep = owner_kept if one_owner else all_kept
-    scores = per_s1_scores(pairs, select(pairs, keep, max_score_per_s1(pairs, keep, len(n_truth)), t, t_empty), n_truth)
+    score_col, method = config.DECIDE_SCORE_COLUMN, config.DECIDE_METHOD
+    _check_method(method, score_col)
+    ids, pairs, n_truth = _load_train(paths)
+    if score_col == "prob" and pairs.label is not None:
+        calibration_table(pairs.score, pairs.label)
+    masks = {True: one_owner_mask(pairs, len(ids.cand)), False: np.ones(len(pairs.s1), dtype=bool)}
+    grid = _grid(pairs)
+    results = {flag: tune(pairs, ids, mask, n_truth, method, grid) for flag, mask in masks.items()}
+    for flag, r in results.items():
+        logger.info("Best %s with one_owner=%s: %s", method, flag, r)
+    auto = config.DECIDE_ONE_OWNER_AUTO
+    one_owner = results[True]["f05"] >= results[False]["f05"] if auto else config.DECIDE_ONE_OWNER
+    if auto:
+        logger.info("Auto one-owner: chose one_owner=%s (F0.5 %.4f vs %.4f)", one_owner,
+                    results[one_owner]["f05"], results[not one_owner]["f05"])
+    rule = results[one_owner]
+    f05 = rule["f05"]
+    scores = per_s1_scores(pairs, apply_rule(pairs, ids, masks[one_owner], {**rule, "method": method}), n_truth)
     table = evaluate.segment_table(scores, n_truth == 0, ids.s1_country)
 
-    cfg = DecisionConfig(t=t, t_empty=t_empty, one_owner=one_owner, score_column=score_col, train_f05=round(f05, 6))
+    cfg = DecisionConfig(t=rule["t"], t_empty=rule["t_empty"], one_owner=bool(one_owner), score_column=score_col,
+                         train_f05=round(f05, 6))
+    saved: dict[str, object] = dict(asdict(cfg))
+    if method != "threshold":
+        saved["method"] = method
+    if method == "per_source":
+        saved.update(t_s2=rule["t_s2"], t_s3=rule["t_s3"])
+    if auto:
+        saved.update(one_owner_auto=True,
+                     f05_by_one_owner={str(k).lower(): round(v["f05"], 6) for k, v in results.items()})
     out = paths.artifacts_dir / DECISION_CONFIG
-    out.write_text(json.dumps(asdict(cfg), indent=2) + "\n", encoding="utf-8", newline="\n")
-    logger.info("Saved %s: %s", out, asdict(cfg))
+    out.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8", newline="\n")
+    logger.info("Saved %s: %s", out, saved)
     if log_row:
         seg = dict(zip(table["segment"], table["f05"], strict=True))
-        other = results[not one_owner][2]
+        other = results[not one_owner]["f05"]
+        desc = "quantile grid" if method == "threshold" else method
         log_experiment(
-            f"A-decide-{pd.Timestamp.now():%Y%m%d-%H%M%S}", "A", f"decide v1 quantile grid ({score_col})",
+            f"A-decide-{pd.Timestamp.now():%Y%m%d-%H%M%S}", "A", f"decide v1 {desc} ({score_col})",
             f05_overall=seg["overall"], f05_singleton=seg.get("singleton"),
             f05_non_singleton=seg.get("non_singleton"), f05_us=seg.get("country=US"),
             f05_india=seg.get("country=India"),
-            notes=f"t={t} t_empty={t_empty} one_owner={one_owner} (other setting {other:.4f}); "
+            notes=f"{ {k: v for k, v in saved.items() if k != 'train_f05'} } (other one_owner setting {other:.4f}); "
                   f"data={paths.data_dir.name}; pairs={len(pairs.s1)}",
         )
     return cfg
+
+
+def run_compare(paths: Paths, split: str = "train") -> None:
+    """Tune every decision variant on the same OOF file and tabulate train F0.5 by segment.
+
+    Variants: each method in ``METHODS`` x one-owner on/off (expected_f05 only
+    when the score column is "prob"). Writes <artifacts>/decide_compare.tsv
+    and logs the table. Does not touch decision_config.json.
+
+    decide_compare.tsv has one row per variant: ``variant`` (str), ``params``
+    (str), then one F0.5 column per segment (``overall``, ``singleton``,
+    ``non_singleton``, ``country=<label>`` ...).
+
+    Memory: as ``run_decide`` (~13 bytes per pair held, plus sort buffers of
+    ~25 bytes per pair while a variant is tuned).
+
+    Args:
+        paths: Run directories (as for ``run_decide``).
+        split: Must be ``"train"`` (runner signature).
+
+    Raises:
+        ValueError: As ``run_decide``.
+    """
+    score_col = config.DECIDE_SCORE_COLUMN
+    ids, pairs, n_truth = _load_train(paths)
+    methods = [m for m in METHODS if m != "expected_f05" or score_col == "prob"]
+    if score_col == "prob" and pairs.label is not None:
+        calibration_table(pairs.score, pairs.label)
+    else:
+        logger.warning("Score column %r is not a probability: skipping expected_f05", score_col)
+    grid = _grid(pairs)
+    rows: list[dict[str, object]] = []
+    for flag in (True, False):
+        keep = one_owner_mask(pairs, len(ids.cand)) if flag else np.ones(len(pairs.s1), dtype=bool)
+        for method in methods:
+            with track_stage(f"compare {method} one_owner={flag}"):
+                rule = tune(pairs, ids, keep, n_truth, method, grid)
+                scores = per_s1_scores(pairs, apply_rule(pairs, ids, keep, {**rule, "method": method}), n_truth)
+            seg = evaluate.segment_table(scores, n_truth == 0, ids.s1_country)
+            params = " ".join(f"{k}={v:.6g}" for k, v in rule.items() if k != "f05" and method != "expected_f05")
+            rows.append({"variant": f"{method}{'+one_owner' if flag else ''}", "params": params,
+                         **dict(zip(seg["segment"], seg["f05"].round(4), strict=True))})
+        del keep
+    table = pd.DataFrame(rows)
+    out = paths.artifacts_dir / COMPARE_FILE
+    table.to_csv(out, sep="\t", index=False, encoding="utf-8", lineterminator="\n")
+    logger.info("Decision variants on %s (%d pairs, %s):\n%s", paths.artifacts_dir / "oof_train.parquet",
+                len(pairs.s1), score_col, table.to_string(index=False))
+    logger.info("Wrote %s", out)
 
 
 class _SlicedIds(Mapping[str, list[str]]):
@@ -443,7 +794,7 @@ def run_write(paths: Paths) -> None:
     ids = load_split_ids(paths, "test")
     pairs = load_pairs(paths.artifacts_dir / "pred_test.parquet", cfg["score_column"], ids, with_label=False)
     keep = one_owner_mask(pairs, len(ids.cand)) if cfg["one_owner"] else np.ones(len(pairs.s1), dtype=bool)
-    sel = select(pairs, keep, max_score_per_s1(pairs, keep, len(ids.s1)), cfg["t"], cfg["t_empty"])
+    sel = apply_rule(pairs, ids, keep, cfg)
     s1_list = ids.s1.tolist()
     n_pairs, n_sel = len(pairs.s1), int(sel.sum())
     n_empty = int((np.bincount(pairs.s1[sel], minlength=len(s1_list)) == 0).sum())
