@@ -69,6 +69,13 @@ RAPIDFUZZ_WORKERS: int = -1  # all cores, for rapidfuzz.process.cdist
 
 N_FOLDS: int = 5
 
+# Decision layer (owner: decide.py). "prob" reads model OOF / test predictions;
+# "score" reads a rule-baseline score column from the same files until the
+# model exists (run_pipeline --decide-score-column).
+DECIDE_SCORE_COLUMN: str = "prob"
+DECIDE_ONE_OWNER: bool = True  # EDA E3: 0 matched IDs shared between S1 lists
+DECIDE_T_GRID: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20))  # 0.05 .. 0.95
+
 
 def _performance_cores() -> int:
     """Number of performance cores on macOS, else ``os.cpu_count()`` (min 1)."""

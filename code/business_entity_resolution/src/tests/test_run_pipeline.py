@@ -42,7 +42,7 @@ def test_stages_wired_to_owner_modules() -> None:
 
 @pytest.mark.parametrize(("stage", "split", "owner"), [
     ("block", "train", "blocking.py"), ("feat", "test", "features.py"), ("train", "train", "model.py"),
-    ("predict", "test", "model.py"), ("decide", "train", "decide.py"), ("write", "test", "decide.py"),
+    ("predict", "test", "model.py"),
 ])
 def test_unimplemented_stages_name_owner(tmp_path: Path, stage: str, split: str, owner: str) -> None:
     """Stub stages raise NotImplementedError naming the owning module."""

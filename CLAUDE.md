@@ -55,8 +55,8 @@ quoting=csv.QUOTE_NONE, encoding="utf-8"`, then assert rows == lines - 1.
 - `features_{split}/part-*.parquet`: s1_id, cand_id, float32 features, label (train)
 - `oof_train.parquet`: s1_id, cand_id, fold, prob, label
 - `pred_test.parquet`: s1_id, cand_id, prob
-- `decision_config.json`: t, t_empty, one_owner, optional per-source
-  thresholds. Tuned on train, applied unchanged to test.
+- `decision_config.json`: t, t_empty, one_owner, score_column (prob|score),
+  train_f05. Tuned on train, applied unchanged to test.
 Contract changes go in `src/contracts.py`; the PR title starts with [CONTRACT].
 
 ## Runner (single entry point, run from code/business_entity_resolution/)
