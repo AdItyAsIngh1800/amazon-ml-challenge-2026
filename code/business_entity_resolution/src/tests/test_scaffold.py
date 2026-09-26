@@ -52,7 +52,7 @@ def test_track_stage_sees_allocation() -> None:
 def test_config_defaults() -> None:
     """Hardware-sized defaults requested by the lead."""
     assert config.BLOCK_CHUNK_S1_ROWS == 10_000
-    assert config.BLOCK_TOP_K == 20 and config.MAX_CANDIDATES_PER_S1 == 50
+    assert config.BLOCK_TOP_K is None and config.MAX_CANDIDATES_PER_S1 == 50
     assert config.FEATURE_CHUNK_PAIRS == 300_000
     assert config.FLOAT_DTYPE is np.float32 and config.INDEX_DTYPE is np.int32
     assert config.RAPIDFUZZ_WORKERS == -1

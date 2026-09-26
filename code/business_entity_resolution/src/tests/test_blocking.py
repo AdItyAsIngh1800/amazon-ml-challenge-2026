@@ -13,7 +13,7 @@ import scipy.sparse as sp
 from src import blocking, config, contracts, normalize
 from src.config import Paths
 
-SPEC = blocking.PassSpec("A", "name_norm", "char", 3, top_k=3, max_df=1.0, min_query_terms=1)
+SPEC = blocking.PassSpec("A", ("name_norm",), "char", 3, top_k=3, max_df=1.0, min_query_terms=1)
 
 
 def _rand_csr(n: int, v: int, seed: int) -> sp.csr_matrix:
@@ -49,6 +49,23 @@ def test_pruned_scores_are_exact_cosines() -> None:
     assert len(set(qi)) == 10  # every query keeps its rarest terms -> gets candidates
 
 
+def test_block_top_k_overrides_every_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """config.BLOCK_TOP_K replaces each pass's K; None keeps the pass's own."""
+    q, c = _rand_csr(8, 30, 4), _rand_csr(40, 30, 5)
+    monkeypatch.setattr(config, "BLOCK_TOP_K", None)
+    assert np.bincount(blocking.top_k_pairs(q, c, SPEC)[0]).max() == 3
+    monkeypatch.setattr(config, "BLOCK_TOP_K", 1)
+    assert np.bincount(blocking.top_k_pairs(q, c, SPEC)[0]).max() == 1
+
+
+def test_pass_text_joins_columns() -> None:
+    """Multi-column passes join with " | "; rows empty in every column stay empty."""
+    rec = pd.DataFrame({"name_norm": ["acme", ""], "name_key": ["akm", ""]})
+    spec = replace(SPEC, columns=("name_norm", "name_norm", "name_key"))
+    assert blocking.pass_text(rec, spec).tolist() == ["acme | acme | akm", ""]
+    assert blocking.pass_text(rec, SPEC).tolist() == ["acme", ""]
+
+
 def test_prune_query_keeps_rarest_terms() -> None:
     """Common columns are dropped except each row's min_terms rarest."""
     q = sp.csr_matrix(np.array([[1, 1, 1, 0], [0, 1, 1, 0], [0, 0, 0, 0]], dtype=np.float32))
@@ -71,6 +88,9 @@ def test_union_passes() -> None:
     np.testing.assert_allclose(u["best_block_score"], [0.95, 0.9, 0.4])
     assert u["union_rank"].tolist() == [1, 2, 1]
     assert np.isnan(u["pass_B_score"].iloc[1]) and u["pass_A_rank"].iloc[0] == 2
+    k = blocking.RRF_K
+    np.testing.assert_allclose(u["rrf_score"], [1 / (k + 2) + 1 / (k + 1), 1 / (k + 1), 1 / (k + 1)], rtol=1e-6)
+    assert u["rrf_score"].dtype == np.float32
 
 
 def test_union_rank_uses_rank_fusion() -> None:
@@ -141,7 +161,8 @@ def test_run_stage_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert out["cand_id"].str.match(r"S[23]-").all() and out["s1_id"].str.startswith("S1-").all()
     assert (out["cand_source"] == out["cand_id"].str[:2]).all()
     assert out["pass_C_score"].isna().all() and out["pass_F_rank"].isna().all()
-    assert out["best_block_score"].dtype == np.float32
+    assert out["best_block_score"].dtype == np.float32 and out["rrf_score"].dtype == np.float32
+    assert (out["rrf_score"] > 0).all()
     # S3-3 (India) has the same name as S1-1 (US) but must never be its candidate.
     assert not ((out["s1_id"] == "S1-1") & (out["cand_id"] == "S3-3")).any()
     assert {("S1-1", "S2-1"), ("S1-2", "S2-2"), ("S1-4", "S2-3")} <= set(zip(out["s1_id"], out["cand_id"]))

@@ -58,7 +58,7 @@ INDEX_DTYPE = np.int32
 
 # Blocking (owner: blocking.py).
 BLOCK_CHUNK_S1_ROWS: int = 10_000
-BLOCK_TOP_K: int = 20  # per pass
+BLOCK_TOP_K: int | None = None  # overrides every pass's K; None = each pass's own
 MAX_CANDIDATES_PER_S1: int = 50
 RECALL_K_VALUES: tuple[int, ...] = (5, 10, 20, 50)
 PASS_C_MIN_NAME_COSINE: float = 0.2

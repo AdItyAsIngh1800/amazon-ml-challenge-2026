@@ -18,11 +18,12 @@ RECORDS_COLUMNS: tuple[str, ...] = (
 )
 
 # candidates_{split}.parquet — one row per (S1, S2/S3 candidate) pair.
+# rrf_score: reciprocal rank fusion of the pass ranks, the value the cap ranks by.
 CANDIDATES_COLUMNS: tuple[str, ...] = (
     "s1_id", "cand_id", "cand_source", "country_match",
     "pass_A_score", "pass_A_rank", "pass_B_score", "pass_B_rank",
     "pass_C_score", "pass_C_rank", "pass_F_score", "pass_F_rank",
-    "n_passes", "best_block_score", "rev_n_s1", "rev_rank", "rev_gap",
+    "n_passes", "best_block_score", "rrf_score", "rev_n_s1", "rev_rank", "rev_gap",
 )
 
 # features_{split}/part-*.parquet — key columns; feature columns are float32,
