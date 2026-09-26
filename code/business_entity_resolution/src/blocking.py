@@ -47,6 +47,7 @@ from __future__ import annotations
 import gc
 import logging
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,7 +60,7 @@ import scipy.sparse as sp
 from numpy.typing import NDArray
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from src import config, contracts, evaluate, experiment_log, io_utils
+from src import config, contracts, evaluate, experiment_log, io_utils, logging_utils
 from src.config import Paths
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,7 @@ def pass_text(rec: pd.DataFrame, spec: PassSpec) -> pd.Series:
     return text.where((rec[cols] != "").any(axis=1), "")
 
 
-def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
+def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec, country: str = "") -> tuple[
     NDArray[np.int32], NDArray[np.int32], NDArray[np.float32], NDArray[np.int32]
 ]:
     """Top-K candidates per query row by cosine, without a full similarity matrix.
@@ -259,6 +260,7 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
         c: L2-normalised candidate rows, float32 CSR, shape (n_c, V).
         spec: Pass settings (top_k, max_df, min_query_terms, rescore_k);
             ``config.BLOCK_TOP_K`` replaces ``top_k`` when not None.
+        country: Country label for the progress log lines only.
 
     Returns:
         ``(q_idx, c_idx, score, rank)``: local row indices into ``q`` and
@@ -277,11 +279,17 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
     chunks = _chunk_bounds(row_nnz, BLOCK_MAX_PRODUCT_NNZ, config.BLOCK_CHUNK_S1_ROWS)
     out: list[tuple[NDArray[np.int32], NDArray[np.int32], NDArray[np.float32], NDArray[np.int32]]] = []
     max_nnz = 0
-    for a, b in chunks:
+    every = max(1, len(chunks) // 20)  # progress line about every 5% of chunks
+    start = time.perf_counter()
+    for i, (a, b) in enumerate(chunks, 1):
         prod = (qp[a:b] @ ct).tocsr()
         max_nnz = max(max_nnz, prod.nnz)
         rows, cols = _best_per_row(prod, rescore_k)
         del prod
+        if i % every == 0 or i == len(chunks):
+            elapsed = time.perf_counter() - start
+            logger.info("pass %s country %s: chunk %d/%d, elapsed %.0fs, ETA %.0fs", spec.name, country, i,
+                        len(chunks), elapsed, elapsed / i * (len(chunks) - i))
         if not len(rows):
             continue
         rows += a
@@ -328,7 +336,8 @@ def _vectorizer(spec: PassSpec) -> TfidfVectorizer:
                            lowercase=False, dtype=np.float32)
 
 
-def run_pass(texts: pd.Series, s1_pos: NDArray[np.int32], cand_pos: NDArray[np.int32], spec: PassSpec) -> PassResult:
+def run_pass(texts: pd.Series, s1_pos: NDArray[np.int32], cand_pos: NDArray[np.int32], spec: PassSpec,
+             country: str = "") -> PassResult:
     """Run one pass for one country.
 
     Args:
@@ -337,19 +346,21 @@ def run_pass(texts: pd.Series, s1_pos: NDArray[np.int32], cand_pos: NDArray[np.i
         s1_pos: Global record indices of the country's S1 (ascending).
         cand_pos: Global record indices of the country's S2/S3.
         spec: Pass settings.
+        country: Country label for log lines only.
 
     Returns:
         Pairs with global indices, sorted by (s1, rank).
     """
     ok = texts.to_numpy() != ""
     all_pos = texts.index.to_numpy()
-    x = _vectorizer(spec).fit_transform(texts[ok].tolist()).tocsr()
+    with logging_utils.track_stage(f"pass {spec.name} country {country} TF-IDF fit"):
+        x = _vectorizer(spec).fit_transform(texts[ok].tolist()).tocsr()
     row_of = pd.Series(np.arange(int(ok.sum())), index=all_pos[ok])
     q_pos = s1_pos[ok[np.searchsorted(all_pos, s1_pos)]]
     c_pos = cand_pos[ok[np.searchsorted(all_pos, cand_pos)]]
     q, c = x[row_of[q_pos].to_numpy()], x[row_of[c_pos].to_numpy()]
     del x  # keep only the S1 / candidate slices during top-K
-    qi, ci, sc, rk = top_k_pairs(q, c, spec)
+    qi, ci, sc, rk = top_k_pairs(q, c, spec, country)
     return PassResult(q_pos[qi].astype(np.int32), c_pos[ci].astype(np.int32), sc, rk)
 
 
@@ -657,7 +668,7 @@ def run_stage(paths: Paths, split: str) -> None:
         is_s1 = (grp["source"] == "S1").to_numpy()
         s1_pos, cand_pos = pos[is_s1].astype(np.int32), pos[~is_s1].astype(np.int32)
         logger.info("Country %s: %d S1, %d S2/S3", country, len(s1_pos), len(cand_pos))
-        results = {p.name: run_pass(pass_text(grp, p), s1_pos, cand_pos, p) for p in PASSES}
+        results = {p.name: run_pass(pass_text(grp, p), s1_pos, cand_pos, p, str(country)) for p in PASSES}
         gc.collect()
         for a in range(0, len(s1_pos), config.BLOCK_CHUNK_S1_ROWS):
             lo, hi = int(s1_pos[a]), int(s1_pos[min(a + config.BLOCK_CHUNK_S1_ROWS, len(s1_pos)) - 1])
