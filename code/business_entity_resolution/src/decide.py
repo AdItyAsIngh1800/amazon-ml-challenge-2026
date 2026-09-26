@@ -138,12 +138,12 @@ def load_split_ids(paths: Paths, split: str) -> SplitIds:
     rec = io_utils.load_parquet(paths.artifacts_dir / f"records_{split}.parquet",
                                 columns=["entity_id", "source", "country"])
     is_s1 = (rec["source"] == "S1").to_numpy()
-    subset = paths.artifacts_dir / f"blocking_s1_subset_{split}.parquet"
-    if split == "train" and subset.exists():
+    blocked = io_utils.load_blocked_s1(paths.artifacts_dir, split) if split == "train" else None
+    if blocked is not None:
         n_all = int(is_s1.sum())
-        is_s1 = is_s1 & rec["entity_id"].isin(io_utils.load_parquet(subset, ["s1_id"])["s1_id"]).to_numpy()
-        logger.warning("%s: decide uses %d of %d train S1; %d unblocked S1 excluded",
-                       subset.name, int(is_s1.sum()), n_all, n_all - int(is_s1.sum()))
+        is_s1 = is_s1 & rec["entity_id"].isin(blocked).to_numpy()
+        logger.warning("decide/compare: using %d of %d train S1; %d unblocked S1 excluded (blocking S1 subset)",
+                       int(is_s1.sum()), n_all, n_all - int(is_s1.sum()))
     s1 = pd.Index(rec.loc[is_s1, "entity_id"])
     cand = pd.Index(rec.loc[(rec["source"] != "S1").to_numpy(), "entity_id"])
     k1, k2 = id_keys(pa.array(s1)), id_keys(pa.array(cand))

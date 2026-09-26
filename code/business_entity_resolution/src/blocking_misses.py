@@ -242,7 +242,7 @@ def _capped_out(path: Path, ids: pa.Array, miss_key: NDArray[np.int64]) -> NDArr
 
 
 def analyze(records_path: Path, candidates_path: Path, capped_out_path: Path,
-            gt_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+            gt_path: Path, blocked_s1: pd.Index | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Find the true pairs missing from the candidates and describe each miss.
 
     Args:
@@ -250,6 +250,9 @@ def analyze(records_path: Path, candidates_path: Path, capped_out_path: Path,
         candidates_path: candidates_train.parquet with ``s1_id, cand_id`` (str).
         capped_out_path: blocking_capped_out_train.parquet (``s1_id, cand_id``).
         gt_path: train ground-truth TSV.
+        blocked_s1: S1 IDs blocked under ``--block-s1-fraction``
+            (``io_utils.load_blocked_s1``); true pairs of other S1 are
+            ignored. None = every S1 was blocked.
 
     Returns:
         ``(truth, misses)``: truth has one row per true pair (categorical
@@ -271,6 +274,13 @@ def analyze(records_path: Path, candidates_path: Path, capped_out_path: Path,
     countries, sources = cty.dictionary.to_pylist(), src.dictionary.to_pylist()
 
     s1, cand = _truth_pairs(gt_path, ids)
+    if blocked_s1 is not None:
+        is_s1 = source == sources.index("S1")
+        keep = np.isin(s1, _index_of(ids, pa.array(blocked_s1, pa.string())))
+        logger.warning("Blocking S1 subset: %d of %d train S1 were blocked; %d unblocked S1 and their %d true "
+                       "pairs are excluded", len(blocked_s1), int(is_s1.sum()), int(is_s1.sum()) - len(blocked_s1),
+                       int((~keep).sum()))
+        s1, cand = s1[keep], cand[keep]
     found, n_cands = _scan_candidates(candidates_path, ids, s1 * len(ids) + cand)
     truth = pd.DataFrame({"country": pd.Categorical.from_codes(country[s1], countries),
                           "cand_source": pd.Categorical.from_codes(source[cand], sources), "missed": ~found})
@@ -360,7 +370,8 @@ def run(paths: Paths, n_examples: int) -> Path:
     """
     art = paths.artifacts_dir
     truth, miss = analyze(art / "records_train.parquet", art / "candidates_train.parquet",
-                          art / "blocking_capped_out_train.parquet", paths.data_dir / "train" / "train_ground_truth.tsv")
+                          art / "blocking_capped_out_train.parquet", paths.data_dir / "train" / "train_ground_truth.tsv",
+                          io_utils.load_blocked_s1(art, "train"))
     out = art / "blocking_misses"
     out.mkdir(parents=True, exist_ok=True)
     miss.to_csv(out / "missed_pairs.tsv", sep="\t", index=False, float_format="%.4f", lineterminator="\n",
