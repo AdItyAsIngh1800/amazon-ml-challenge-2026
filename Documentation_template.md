@@ -1,73 +1,417 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
-**Submission Date:** [Date]
+**Team Name:** TODO  
+**Team Members:** TODO  
+**Submission Date:** TODO
+
+> Draft status: every number below comes from `artifacts/eda/eda_report.txt` (full-data
+> EDA), `artifacts/experiments.tsv` or a merged/open PR description, and is labelled with
+> the data it was measured on. The **dev sample** is 10% of train S1 (220,683 S1); the
+> **mini sample** is ~1% (22,068 S1). Both overstate precision (fewer competing
+> candidates), so every decision threshold in the submission is tuned on full train.
+> Anything not yet measured on full data is marked **TODO**.
 
 ---
 
 ## 1. Executive Summary
-*Provide a brief 2-3 sentence overview of your approach and key innovations.*
+
+A four-stage, country-agnostic pipeline: TF-IDF blocking within each country label (name
+character 3-grams on transliterated + phonetic text, address words), fused by reciprocal
+rank and capped at 50 candidates per S1; 69 pairwise similarity, group-context and
+blocking features; a LightGBM classifier trained with 5-fold GroupKFold by S1 so every
+train pair gets an out-of-fold probability; and a decision layer that tunes thresholds
+directly for macro F0.5 over all train S1, including singletons and a one-owner rule. The
+main innovations are an in-house Indic-script → Latin transliterator with a phonetic name
+key (for cross-script India pairs) and a decision layer optimised for the exact challenge
+metric rather than for pair-level accuracy.
 
 ---
 
 ## 2. Methodology
 
 ### 2.1 Problem Analysis
-*Key insights discovered during EDA — noise patterns, address variations, missing fields, etc.*
+
+Full-data EDA (`artifacts/eda/eda_report.txt`, sections E1–E13; summary numbers only):
+
+| Finding | Number | Implication |
+|---|---|---|
+| Train size (S1 / S2 / S3) | 2,206,821 / 5,034,616 / 5,285,603 (US + India) | ~110M candidate pairs at 50 per S1 |
+| Test size (S1 / S2 / S3) | 1,732,544 / 4,887,273 / 5,082,316 (US + India + **France**) | France (259,452 S1) never appears in train |
+| S2+S3 records per S1 | train 4.68, test 5.75 | Test is denser: more distractors per S1 |
+| Singleton S1 (no match) (E2) | 5.58% | Each is a full point: predicting nothing must be possible |
+| Mean matches per S1 (E2) | 3.46 (S2 1.67, S3 1.79); 76.8% of S1 have 2+ matches from one source | Many-to-one within a source is normal; no 1:1 assumption |
+| One-owner check (E3) | 0 of 7,638,365 matched S2/S3 IDs appear in more than one S1 list | Enforce "each S2/S3 ID belongs to at most one S1" |
+| Distractors (E4) | 25.99% of train S2/S3 records are in no ground-truth list | Blocking must tolerate unmatched near-duplicates |
+| Country agreement (E5) | 100.00% of true pairs share the country label (0 mismatches) | Block within country label; no cross-country pass |
+| Empty fields (E6) | Names never empty; 2.3–3.7% of S2/S3 addresses empty (all countries) | Features must handle a missing side (NaN) |
+| Postal-like tokens (E7) | Standalone 5–6 digit token in ~11% of US records, 0.3–1.1% of India, 0.4–0.5% of France (test); 5.08% of true pairs share one | Useful signal, but only for a minority of pairs |
+| Exact name match (E8, lowercase letters+digits) | 22.94% of true pairs (India 16.29%, US 27.39%) | Exact-key blocking would miss ~77% of matches |
+| Name-only TF-IDF recall (E9) | R@50 = 0.700, R@100 = 0.730 over all same-country S2/S3 | Name alone cannot block; an address pass is needed |
+| Non-ASCII records (E12) | India 33.47%, US 5.56% (train); France 41.76% (test) | Unicode normalisation and transliteration are required |
+| Cross-script India names (PR #8, dev sample) | 16.9% of India true pairs pair a Latin name with an Indic-script name; their name R@20 with plain normalisation was 0.002 | Transliteration + phonetic key |
+| Ground-truth integrity (E13) | 0 duplicate S1, 0 missing IDs, 0 S1 IDs inside lists | Labels can be used as-is |
+
+Noise patterns seen in the ground truth (E10/E11 token statistics): legal-form variants
+(pvt/private, ltd/limited, llc/inc, transliterated legal forms), injected noise words after
+the legal form ("center", "services", ".com"), leading honorifics (mr/dr/smt), word-order
+changes, character typos and accents, abbreviated vs. spelled-out street types and state
+names, and address components in a different order.
 
 ### 2.2 Solution Strategy
-*Outline your high-level approach.*
 
-**Approach Type:** [Blocking + Classifier / End-to-End / Graph-Based / Hybrid, etc]  
-**Core Innovation:** [Brief description of your main technical contribution]
+**Approach Type:** Blocking + Classifier (+ metric-optimised decision layer)  
+**Core Innovation:** Indic-script transliteration with a phonetic name key for
+cross-script matching, reciprocal-rank-fused multi-pass blocking with reverse
+(candidate-side) features, and a decision layer tuned for macro F0.5 over all S1
+(singletons included) under a one-owner constraint.
+
+Pipeline (one entry point, `python -m src.run_pipeline --stage ... --split ...`):
+
+1. **prep:** normalise and tokenise names and addresses (Section 4.1).
+2. **block:** candidate generation, at most 50 S2/S3 per S1 (Section 3).
+3. **feat:** 69 float32 features per candidate pair (Section 4.2).
+4. **train / predict:** LightGBM, GroupKFold by S1; out-of-fold probabilities on train,
+   fold-mean probabilities on test (Section 4.3).
+5. **decide / write:** tune the decision rule on train OOF, apply it unchanged to test,
+   write and validate both TSVs (Section 4.5).
+
+**Country-agnostic design for unseen France.** Country is treated as an open set: no
+country filtering, one-hot or identity features, and no per-country code paths. Blocking
+runs separately for each country label found in the split, whatever it is, so France gets
+the same passes as US and India. The only country-derived feature is `country_match`, an
+agreement flag. TF-IDF vectorisers are fitted per split and per country on that split's
+own records, and feature IDF uses a hashing vectoriser, so France's vocabulary has no
+out-of-vocabulary tokens. The normalisation dictionaries include French legal forms and
+street types taken from the test-side token statistics (E10) and are applied to every
+record without a country condition. Leave-one-country-out (LOCO) results are in
+Section 4.4.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
-*Describe how you reduced the comparison space to a manageable candidate set.*
 
-- **Blocking keys used:** [e.g., PIN code, phonetic name encoding, TF-IDF, etc.]
-- **Candidate pairs generated:** [total]
+- **Blocking keys used:** two TF-IDF cosine passes, each fitted per country label on that
+  split's S1+S2+S3 records and never crossing countries (E5):
+  - **Pass A (name):** character 3-grams on the composite text
+    `name_norm | name_norm | name_key` (normalised name weighted twice plus the phonetic
+    key); top K = 50 per S1.
+  - **Pass B (address):** word unigrams on `addr_norm` (empty addresses skipped); top
+    K = 50 per S1. On the dev sample, words beat character 3-grams for addresses on both
+    recall and RAM (single-pass R@50 India 0.900 vs 0.853, US 0.928 vs 0.883; PR #7).
+  - The candidates contract reserves passes C (postal) and F; they are not implemented and
+    are written as all-NaN.
+- **Candidate pairs generated:** dev sample 11.03M pairs for 220,683 S1 (50.0 per S1);
+  mini sample 1,103,400 pairs for 22,068 S1. Full train and test: **TODO** (expected ~110M
+  train pairs at 50 per S1).
 - **How you ensured true matches were not lost:**
+  - *No full similarity matrix.* Query-side pruning keeps each S1 row's n-grams with
+    document frequency ≤ `max_df` × pool plus always its `min_query_terms` rarest ones
+    (Pass A: 0.001 / 16; Pass B: 0.003 / 3). Sparse products are chunked by an nnz upper
+    bound (≤ 50M nnz per product). The top 200 partial scores per S1 are rescored with the
+    exact cosine, then the top K are kept. Plain feature-level `max_df` pruning had cut
+    India R@50 from 0.697 to 0.479, so it was rejected (PR #7). Raising Pass A's
+    `min_query_terms` from 4 to 16 took Pass A R@50 on 5,000 S1/country from
+    0.695 → 0.732 (India) and 0.752 → 0.870 (US) (PR #12).
+  - *Union with a reciprocal-rank-fusion cap.* The pass results are unioned, and the
+    50-per-S1 cap keeps the pairs with the highest RRF score Σ 1/(10 + rank). On the dev
+    sample, RRF at cap 50 keeps pair recall 0.9773 against 0.9511 for a max-score cap; RRF
+    at cap 20 (0.9693) already beats max-score at cap 50 (PR #7).
+  - *Reverse features.* For each candidate, computed over all S1 of the split:
+    `rev_n_s1` (how many S1 retrieved it), `rev_rank` (its rank among them) and `rev_gap`
+    (score gap to its best S1). These carry the one-owner structure into the model.
+  - *Recall tracking* on every train run (`blocking_recall_train.tsv`, experiment log).
+
+**Dev-sample pair recall (train, 220,683 S1, 763,722 true pairs; experiment log rows
+block-v0 04:46 and block-v1 15:02; PR #12).** v0 = Pass A on `name_norm` only, prep v0;
+v1 = Pass A on `name_norm | name_norm | name_key`, `min_query_terms` 16, prep v1.
+
+| Variant | block-v0 | block-v1 | Δ |
+|---|---|---|---|
+| Pass A (ALL) | 0.7514 | 0.8125 | +0.0611 |
+| Pass B (ALL) | 0.9169 | 0.9199 | +0.0030 |
+| Union, uncapped | 0.9804 | 0.9858 | +0.0054 |
+| Union @20 | 0.9693 | 0.9752 | +0.0059 |
+| **Union @50 (shipped)** | **0.9773** | **0.9826** | **+0.0053** |
+| Union @50, India | 0.9668 | 0.9713 | +0.0045 |
+| Union @50, US | 0.9843 | 0.9902 | +0.0059 |
+| S1 fully covered @50 | 93.48% | 94.96% | +1.48 pp |
+
+Full-train recall: **TODO** (target ≥ 98%).
+
+**Miss analysis (PR #15, mini sample, block-v1; experiment row block-v1 17:31).** 530 of
+76,280 true pairs (0.69%) are not candidates: India 444 of 30,434 (1.46%), US 86 of 45,846
+(0.19%); S2 290, S3 240. Primary cause (first match in this order):
+
+| Primary cause | Pairs | Share of misses |
+|---|---|---|
+| Cross-script names (one side pure Latin, the other pure Indic; all India) | 258 | 48.7% |
+| Pushed out by the 50 cap (India 69, US 30) | 99 | 18.7% |
+| Empty address on one side | 89 | 16.8% |
+| Low name and address similarity (both < 0.3) | 9 | 1.7% |
+| Other | 75 | 14.2% |
+
+Cross-script pairs are 58% of India misses, so Indic-side transliteration/phonetics is the
+largest remaining recall lever; the cap costs 0.13 pp of recall. Full-train breakdown:
+**TODO** (`python -m src.blocking_misses`).
 
 ---
 
 ## 4. Matching Model
 
-**Features used:**
-- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]
-- Address features: [e.g., token overlap, edit distance, PIN code matching]
-- Other: []
+### 4.1 Normalisation and transliteration (prep)
 
-**Model type:** [e.g., XGBoost, Siamese Network, Transformer, etc.]  
-**Threshold selection method:** [e.g., F_0.5 optimization on validation set]
+- Unicode NFKD with accent stripping (standard library `unicodedata`), lower-casing,
+  punctuation removal; CSV-escaped quotes kept literally when reading and stripped here.
+- **Indic → Latin transliteration** (own code, `transliterate.py`, no dependencies):
+  Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada and Malayalam are mapped to
+  Devanagari by Unicode block offset (non-aligned code points are mapped explicitly), then
+  Devanagari is romanised (inherent vowel, virama, vowel signs, final-schwa deletion,
+  anusvara/visarga/nukta rules). Indic digits become ASCII, so Indic postcodes become
+  postal tokens.
+- **Phonetic name key** (`name_key`): the same rules for every record, e.g. collapse vowel
+  length and aspiration, merge letter variants (x→ks, q→k, z→j, f→p, c→k, w→v), drop
+  doubled letters and all vowels except a word's first letter. On real cross-script true
+  pairs, the median rapidfuzz ratio of `name_key` is 85–95 in every script, against ~10
+  on raw names (PR #8).
+- **Dictionaries as domain rules** (`dictionaries.py`; data only; every entry commented
+  with its EDA/dev-sample evidence): legal forms and their transliterated and French
+  variants (→ `legal_suffix`, with `name_core` = name without legal forms), noise words
+  injected after legal forms, leading honorifics, name abbreviations (shri/shree → sri),
+  address abbreviations (street types, US and India state names → codes) and landmark
+  words. They encode general knowledge about business names and addresses and are applied
+  to every record regardless of country; no external data or lookup is used.
+- **Postal tokens:** every standalone 5–6 digit number, all countries, plus joined
+  `ddd ddd` pairs (E7 pattern). This raised the share of India true pairs sharing a postal
+  token from 0.25% to 1.88% on the dev sample (PR #9).
+
+Name TF-IDF recall on the dev sample (E9 method, 5,000 S1 per country, R@20; PR #8, #9;
+rows norm-001, norm-002): India 0.661 (prep v0) → 0.683 (transliteration + key) → 0.692
+(dictionaries); US 0.829 → 0.835 → 0.836. India cross-script pairs: R@20 0.002 → 0.158.
+Address TF-IDF R@20: India 0.864 → 0.879, US 0.920 → 0.925.
+
+### 4.2 Features (69, all float32; `features.py`)
+
+**Features used:**
+- **Name features (similarity group, part of 37):** rapidfuzz ratio, token_set,
+  token_sort, partial, Jaro-Winkler and normalised Levenshtein on both `name_core` and
+  `name_norm`; `name_key` ratio; `name_translit` ratio and token_set; character 3-gram
+  TF-IDF cosine; IDF-weighted and plain token Jaccard; acronym match both ways; legal
+  suffix equal / conflict / missing; length ratio; first-token match; digit-token Jaccard
+  and a one-side-digits flag.
+- **Address features (similarity group):** postal match / conflict / missing; number-token
+  overlap and conflict; word TF-IDF cosine; IDF-weighted and plain token Jaccard;
+  token_set on `addr_norm` and `addr_translit`.
+- **Record flags (7):** landmark flag, empty name and empty address for both sides;
+  `cand_is_s3`.
+- **Group context within each S1 (10):** candidate count; rank, gap to the best candidate
+  and z-score of `name_char3_cos`, `name_core_token_set` and `addr_tok_cos`.
+- **Blocking (15):** `country_match` (agreement flag), per-pass score and rank for passes
+  A, B, C, F (C and F are all-NaN), `n_passes`, `best_block_score`, `rrf_score`, and the
+  reverse features `rev_n_s1`, `rev_rank`, `rev_gap`.
+
+Undefined similarities (an empty side) are NaN, which LightGBM handles natively. Feature
+IDF uses a `HashingVectorizer` (2^20 buckets) with document frequencies counted over every
+record of the split. No feature identifies a country (a unit test checks this).
+Strongest single features on the mini sample (AUC): `addr_norm_token_set` 0.994,
+`rrf_score` 0.994, `pass_B_score` 0.990 (row feat-001).
+
+### 4.3 Model
+
+**Model type:** LightGBM 4.7.0 binary classifier (gradient-boosted trees, trained from
+scratch; no pretrained model). Parameters: learning rate 0.05, 127 leaves,
+`min_data_in_leaf` 100, feature and bagging fraction 0.8, L2 1.0, `max_bin` 255, up to
+3,000 rounds with early stopping after 100 rounds on 10% of the sampled S1 groups;
+`deterministic=True`, seed 42, fixed thread count.
+
+- **Folds:** 5-fold GroupKFold by S1 over **all** train S1, so no S1 appears in both the
+  training and the held-out part of a fold.
+- **Out-of-fold predictions:** every train pair is predicted by the model of its held-out
+  fold, so the OOF file covers all ~110M train pairs and the decision layer is tuned on
+  exactly the pair distribution the test predictions will have.
+- **Training-row cap:** one shared sample of whole S1 groups
+  (`config.TRAIN_MAX_ROWS` = 10M × 5/4 pairs) is binned once; each fold trains on its
+  ~10M-row subset. This bounds peak RAM (projected ~5.5 GB at full scale; PR #14).
+- **Test:** mean probability of the 5 fold models.
+
+Mini sample (row feat-002, PR #14): OOF AUC 0.99998; best iterations 176–195 per fold.
+Full train: **TODO**.
+
+### 4.4 Leakage audit and LOCO (PR #20, mini sample)
+
+- **No leak.** The 69 model features exclude `s1_id`, `cand_id`, `fold`, `label` and
+  `prob`, and match the saved model's feature names. The ground truth is read only to
+  create labels and to tune the decision layer; blocking and normalisation never read it.
+  IDF, reverse and group features are unsupervised and computed the same way on test. No
+  single feature separates the labels (best single-feature AUC 0.994).
+- **Feature-group ablation** (same CV recipe; macro F0.5): full 69 features 0.9920;
+  name + address similarity only (37) 0.9905; full without blocking features 0.9914;
+  full without group features 0.9920. Blocking features dominate gain but add only
+  +0.0006 F0.5; name and address similarity carry the model.
+- **LOCO** (train on one country's S1, tune thresholds on that country's OOF, score the
+  other country with the fold-mean model):
+
+| Features | US → India | India → US | Mean |
+|---|---|---|---|
+| In-distribution (reference) | 0.9879 | 0.9948 | 0.9914 |
+| **Full (69)** | **0.9831** | **0.9933** | **0.9882** |
+| Similarity only (37) | 0.9813 | 0.9920 | 0.9867 |
+| Full without blocking features | 0.9825 | 0.9926 | 0.9876 |
+
+  The drop for an unseen country is 0.005 (India) and 0.0015 (US). Source-country
+  thresholds are within 0.001 of thresholds re-tuned on the target country, so
+  calibration transfers. Drop-one-feature LOCO (69 runs): deltas −0.0003 to +0.0006, none
+  reaches the +0.002 acceptance bar, so no feature was removed.
+- **Caveat:** the mini sample keeps all true matches plus *random* distractors, so hard
+  negatives are rare; these ~0.99 scores will not carry over to full data. Full-train LOCO:
+  **TODO**.
+
+### 4.5 Decision layer
+
+**Threshold selection method:** direct maximisation of the challenge metric (macro F0.5
+over **all** train S1, singletons included) on the full-train out-of-fold probabilities.
+True-match counts come from the ground truth, so pairs lost in blocking count as false
+negatives. The tuned rule is saved in `decision_config.json` and applied unchanged to
+test.
+
+- **One-owner rule:** each S2/S3 ID is kept only for the S1 that gives it the highest
+  score (ties → lowest S1), following E3. It can be on, off, or chosen automatically by
+  train F0.5.
+- **Rules** (`--decide-method`):
+  - `threshold`: keep candidates with prob ≥ t; return an empty list when the S1's best
+    prob < `t_empty` (protects singletons).
+  - `per_source`: separate `t_s2` / `t_s3` (source read from the ID prefix), tuned with
+    `t_empty` by coordinate descent from the global optimum, so never worse than it.
+  - `expected_f05`: per S1, sort candidates by prob and keep the prefix (the empty set
+    included) with the highest expected F0.5, treating probabilities as calibrated.
+- **Threshold grid:** the union of 200 score quantiles (for rank-fusion scores) and a
+  fixed 0.005-step grid on (0, 1). The quantile-only grid had no values between 0.02 and
+  0.99 on probabilities, because almost all pairs score near 0 (PR #20); the fixed grid
+  closes that gap (PR #21, open at the time of writing). The search sorts pairs once and
+  sweeps the grid incrementally (O(n log n)), and unit tests check it against brute force.
+- **Calibration** (mini OOF): expected calibration error 0.0003 (PR #18).
+
+Mini sample, model v0 OOF (rows A-decide-20260926-1739*, -205011, -205447; PR #18, #21):
+
+| Rule (+ one-owner) | Quantile grid only | Quantile ∪ 0.005 grid |
+|---|---|---|
+| threshold | 0.9827 | 0.9922 (t = 0.745, t_empty = 0.875) |
+| per_source | 0.9827 | 0.9922 (t_s2 = 0.80, t_s3 = 0.73) |
+| expected_f05 | 0.9916 | 0.9916 (no grid) |
+
+On the same mini sample, the rule baseline (`rrf_score` only, no model) scores 0.9358 with
+the same decision layer. The final rule is chosen on full train with `--stage compare`:
+**TODO**.
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** [your best validation score]
-- **Common false positives (wrong merges):** [brief description]
-- **Common false negatives (missed matches):** [brief description]
+- **F_0.5 Score (macro):** full-train OOF F0.5: **TODO**, by segment:
+
+| Segment | F0.5 |
+|---|---|
+| Overall | TODO |
+| Singleton S1 | TODO |
+| Non-singleton S1 | TODO |
+| US | TODO |
+| India | TODO |
+| LOCO mean | TODO |
+
+- **Decision-variant comparison (full train, `decide_compare.tsv`):** TODO (threshold /
+  per_source / expected_f05 × one-owner on/off).
+- **Common false positives (wrong merges):** TODO (from full-train OOF; describe patterns
+  only, no raw records).
+- **Common false negatives (missed matches):** TODO (split into blocking misses, see
+  Section 3, and decision/model misses).
 
 ---
 
 ## 6. Conclusion
-*Summarize your approach, key achievements, and lessons learned in 2-3 sentences.*
+
+TODO (after the full-data run).
 
 ---
 
 ## Appendix
 
 ### A. Code Artefacts
-*Your complete, runnable code ships in the submission zip under
-`code/business_entity_resolution/` (all source in `src/`, with a `README.md` and
-`requirements.txt`). Summarise its structure and the entry point(s) to reproduce
-`output/matching_results.tsv` and `output/candidate_pairs.tsv` here.*
+
+Code lives in `code/business_entity_resolution/`: all source in `src/`, plus `README.md`
+and `requirements.txt` (Python 3.13).
+
+| Module | Role |
+|---|---|
+| `run_pipeline.py` | Single entry point; stage dispatch, config overrides, logging, run metadata |
+| `config.py`, `contracts.py` | Tunables and paths; parquet/JSON column contracts |
+| `io_utils.py` | The only TSV reader/writer (QUOTE_NONE, UTF-8, row-count checks) |
+| `normalize.py`, `transliterate.py`, `dictionaries.py` | Stage prep → `records_{split}.parquet` |
+| `blocking.py` | Stage block → `candidates_{split}.parquet` |
+| `features.py` | Stage feat → `features_{split}/part-*.parquet` |
+| `model.py` | Stages train (→ `oof_train.parquet`, `models/`) and predict (→ `pred_test.parquet`) |
+| `decide.py` | Stages decide (→ `decision_config.json`), compare, write (→ both TSVs, validated), baseline |
+| `evaluate.py` | Official F0.5 scorer, segment tables, blocking recall |
+| `make_submission.py` | Builds and checks the submission zip |
+| `eda.py`, `make_dev_sample.py`, `name_recall.py`, `blocking_misses.py` | Analysis and sampling tools |
+| `logging_utils.py`, `experiment_log.py`, `fulldata_lock.py` | Runtime/RAM tracking, experiment log, full-data lock |
+
+Reproduce `output/matching_results.tsv` and `output/candidate_pairs.tsv` from
+`code/business_entity_resolution/` (train split first, then test):
+
+```bash
+pip install -r requirements.txt
+D="--data-dir ../../dataset --out-dir ../../output --artifacts-dir ../../artifacts"
+python -m src.run_pipeline --stage all --split train $D --decide-method threshold   # prep, block, feat, train, decide
+python -m src.run_pipeline --stage all --split test  $D                             # prep, block, feat, predict, write
+python -m src.make_submission --team-name TEAM $D                                   # optional: validated zip
+```
+
+Each stage skips if its outputs exist (`--force` reruns it) and logs runtime and peak RSS.
+The decision method is set to the full-train winner of `--stage compare` (TODO). `write`
+runs `utils/validate_submission.py` and publishes the TSVs only on `PASS`. The README
+gives stage-by-stage commands, data layout, overrides and measured runtimes. Hardware: MacBook
+Air (Apple M4, 16 GB); every stage is designed for ≤ 10 GB peak RAM. Tests:
+`python -m pytest -q src/tests && python -m mypy src`.
 
 ### B. Additional Results
-*Include any additional charts, graphs, or detailed results.*
+
+TODO charts:
+- Blocking recall vs. cap (union @20/30/50/80) per country, full train.
+- F0.5 vs. threshold t (and t_empty) on full-train OOF, per decision method.
+- Calibration (reliability) plot of full-train OOF probabilities.
+- Feature importance (gain) and group ablation, full train.
+- F0.5 by segment (singleton / non-singleton / country) and LOCO.
+
+### C. Models and Libraries
+
+| Component | Version | Licence | Use |
+|---|---|---|---|
+| LightGBM | 4.7.0 | MIT | Pair classifier (trained from scratch; tree ensemble, far below 8B parameters; exact tree count on full data: TODO) |
+| scikit-learn | 1.9.1 | BSD-3-Clause | TF-IDF / hashing vectorisers |
+| rapidfuzz | 3.14.6 | MIT | String similarity features |
+| pandas | 3.0.6 | BSD-3-Clause | Tabular I/O |
+| pyarrow | 25.0.1 | Apache-2.0 | Parquet and Arrow storage |
+| numpy | 2.5.3 | BSD-3-Clause | Arrays |
+| scipy | 1.18.1 | BSD-3-Clause | Sparse matrix products |
+| psutil | 7.2.2 | BSD-3-Clause | Peak-RAM logging |
+| pytest, mypy (dev only) | 9.1.1, 2.3.1 | MIT | Tests and type checks |
+
+No pretrained, hosted or external models are used. Transliteration, phonetic keys and
+dictionaries are our own code (standard-library `unicodedata`; no GPL `unidecode`, no
+libpostal).
+
+### D. Fair Play Statement
+
+- No external data, APIs, geocoding, business registries, lookups or hosted models; no
+  network calls anywhere in `src/`. The dataset never left the local machine.
+- Every learned statistic comes only from the provided challenge data: TF-IDF vectorisers
+  for blocking are fitted per split (and per country label) on that split's own records,
+  feature IDF is counted per split, and the model and decision thresholds are trained and
+  tuned on the train split only, then applied unchanged to test. Test ground truth was
+  never available or used.
+- Normalisation dictionaries are hand-written domain rules (legal forms, abbreviations,
+  honorifics, state names) justified by token statistics of the provided data.
+- Country is never used as an identity feature or filter; only a same-country agreement
+  flag is used.
 
 ---
 
