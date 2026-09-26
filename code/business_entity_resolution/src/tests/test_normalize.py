@@ -57,7 +57,8 @@ def _write_split(root: Path, split: str) -> None:
     rows = {
         1: [("S1-1", "B+ Retail Inc", "12 Main St, Phoenix, AZ 85001", "US")],
         2: [("S2-1", "--", "", "India"), ("S2-2", "Café Lune SARL", "Opp. Gare, 75001 Paris", "France")],
-        3: [("S3-1", "NA", "near Temple Road 560001", "India")],
+        3: [("S3-1", "NA", "near Temple Road 560001", "India"),
+            ("S3-2", "श्री राम ट्रेडर्स", "मुंबई ४००००१", "India")],
     }
     for s, r in rows.items():
         io_utils.write_source_tsv(pd.DataFrame(r, columns=cols), root / split / f"{split}_source{s}.tsv")
@@ -73,14 +74,21 @@ def test_run_stage_writes_contract(tmp_path: Path) -> None:
     schema = pq.read_schema(out)
     assert tuple(schema.names) == contracts.RECORDS_COLUMNS
     df = io_utils.load_parquet(out)
-    assert df["entity_id"].tolist() == ["S1-1", "S2-1", "S2-2", "S3-1"]
-    assert df["source"].tolist() == ["S1", "S2", "S2", "S3"]
+    assert df["entity_id"].tolist() == ["S1-1", "S2-1", "S2-2", "S3-1", "S3-2"]
+    assert df["source"].tolist() == ["S1", "S2", "S2", "S3", "S3"]
     r = df.set_index("entity_id")
     assert r.loc["S2-1", "name_empty"] and r.loc["S2-1", "addr_empty"]
     assert r.loc["S3-1", "name_norm"] == "na" and bool(r.loc["S3-1", "landmark_flag"])
     assert df.loc[df["entity_id"] == "S2-2", "postal_tokens"].map(list).tolist() == [["75001"]]
     assert r.loc["S2-2", "name_core"] == "cafe lune sarl" and r.loc["S2-2", "legal_suffix"] == ""
     assert r.loc["S1-1", "name_acronym"] == "bri"
+    # transliterated before normalisation; Indic digits feed postal tokens
+    assert r.loc["S3-2", "name_translit"] == "shree raam tredars"
+    assert r.loc["S3-2", "name_norm"] == "shree raam tredars"
+    assert r.loc["S3-2", "name_key"] == "sr rm trdrs"
+    assert r.loc["S3-2", "addr_translit"] == "mumbaee 400001"
+    assert df.loc[df["entity_id"] == "S3-2", "postal_tokens"].map(list).tolist() == [["400001"]]
+    assert r.loc["S1-1", "name_translit"] == "B+ Retail Inc" and r.loc["S1-1", "name_key"] == "b rtl ink"
     assert schema.equals(normalize.RECORDS_SCHEMA)
     assert schema.field("postal_tokens").type == pa.list_(pa.string())
     assert schema.field("landmark_flag").type == pa.bool_()
