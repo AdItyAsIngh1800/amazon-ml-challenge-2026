@@ -204,3 +204,71 @@ def test_run_stage_missing_column_raises(tmp_path: Path) -> None:
         paths.artifacts_dir / "records_test.parquet", index=False)
     with pytest.raises(ValueError, match="addr_norm"):
         blocking.run_stage(paths, "test")
+
+
+def test_parallel_top_k_identical_to_serial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BLOCK_WORKERS=3 returns exactly the serial arrays (order, scores, ranks), with pruning on."""
+    monkeypatch.setattr(blocking, "BLOCK_MAX_PRODUCT_NNZ", 20)
+    monkeypatch.setattr(config, "BLOCK_CHUNK_S1_ROWS", 3)
+    q, c = _rand_csr(50, 40, 7), _rand_csr(90, 40, 8)
+    spec = replace(SPEC, max_df=0.1, min_query_terms=2)
+    serial = blocking.top_k_pairs(q, c, spec)
+    monkeypatch.setattr(config, "BLOCK_WORKERS", 3)
+    parallel = blocking.top_k_pairs(q, c, spec)
+    for s, p in zip(serial, parallel, strict=True):
+        assert s.dtype == p.dtype
+        np.testing.assert_array_equal(s, p)
+
+
+def test_run_stage_parallel_identical_to_serial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """candidates_train.parquet is byte-for-byte the same table with 1 and 3 workers."""
+    monkeypatch.setattr(config, "SHARED_ARTIFACTS_DIR", tmp_path / "shared")
+    monkeypatch.setattr(blocking, "BLOCK_MAX_PRODUCT_NNZ", 1)  # one S1 per product chunk
+    paths = _write_synthetic(tmp_path)
+    blocking.run_stage(paths, "train")
+    serial = pd.read_parquet(paths.artifacts_dir / "candidates_train.parquet")
+    monkeypatch.setattr(config, "BLOCK_WORKERS", 3)
+    blocking.run_stage(paths, "train")
+    pd.testing.assert_frame_equal(serial, pd.read_parquet(paths.artifacts_dir / "candidates_train.parquet"))
+
+
+def test_select_s1_fraction_stratified_and_deterministic() -> None:
+    """Each stratum keeps round(f * n); the same call gives the same rows."""
+    strata = pd.Series(["US|matched"] * 10 + ["US|singleton"] * 4 + ["India|matched"] * 6)
+    keep = blocking.select_s1_fraction(strata, 0.5)
+    assert keep[:10].sum() == 5 and keep[10:14].sum() == 2 and keep[14:].sum() == 3
+    np.testing.assert_array_equal(keep, blocking.select_s1_fraction(strata, 0.5))
+
+
+def test_run_stage_s1_fraction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unselected S1 get no candidates; kept S1 get the full-run candidates; f=1 removes the subset file."""
+    monkeypatch.setattr(config, "SHARED_ARTIFACTS_DIR", tmp_path / "shared")
+    paths = _write_synthetic(tmp_path)
+    blocking.run_stage(paths, "train")
+    full = pd.read_parquet(paths.artifacts_dir / "candidates_train.parquet")
+    monkeypatch.setattr(config, "BLOCK_S1_FRACTION", 0.5)
+    blocking.run_stage(paths, "train")
+    sub = pd.read_parquet(paths.artifacts_dir / "candidates_train.parquet")
+    kept = set(pd.read_parquet(paths.artifacts_dir / "blocking_s1_subset_train.parquet")["s1_id"])
+    # strata: US|matched {S1-1, S1-2} -> 1, US|singleton {S1-3} -> round(0.5) = 0, India|matched {S1-4} -> 0
+    assert len(kept) == 1 and set(sub["s1_id"]) == kept
+    cols = ["s1_id", "cand_id", "pass_A_score", "pass_A_rank", "pass_B_score", "pass_B_rank", "rrf_score"]
+    pd.testing.assert_frame_equal(sub[cols].reset_index(drop=True),
+                                  full.loc[full["s1_id"].isin(kept), cols].reset_index(drop=True))
+    rep = pd.read_csv(paths.artifacts_dir / "blocking_recall_train.tsv", sep="\t")
+    assert rep[(rep["country"] == "ALL") & (rep["variant"] == "union")].iloc[0]["n_s1"] == 1
+    monkeypatch.setattr(config, "BLOCK_S1_FRACTION", 1.0)
+    blocking.run_stage(paths, "train")
+    assert not (paths.artifacts_dir / "blocking_s1_subset_train.parquet").exists()
+
+
+def test_s1_fraction_refused_on_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fraction never applies to the test split (stage and CLI)."""
+    paths = _write_synthetic(tmp_path)
+    (paths.artifacts_dir / "records_train.parquet").rename(paths.artifacts_dir / "records_test.parquet")
+    monkeypatch.setattr(config, "BLOCK_S1_FRACTION", 0.5)
+    with pytest.raises(ValueError, match="train-only"):
+        blocking.run_stage(paths, "test")
+    from src import run_pipeline
+    with pytest.raises(SystemExit):
+        run_pipeline.main(["--stage", "block", "--split", "test", "--block-s1-fraction", "0.5"])
