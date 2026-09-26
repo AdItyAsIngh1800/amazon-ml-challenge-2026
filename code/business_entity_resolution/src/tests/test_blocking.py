@@ -40,6 +40,24 @@ def test_top_k_matches_brute_force(monkeypatch: pytest.MonkeyPatch) -> None:
     assert sc.dtype == np.float32 and qi.dtype == np.int32
 
 
+
+def test_progress_logging(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Chunk progress is logged about every 5% (plus the last chunk); the fit logs start/end."""
+    monkeypatch.setattr(config, "BLOCK_CHUNK_S1_ROWS", 1)
+    q, c = _rand_csr(40, 30, 0), _rand_csr(20, 30, 1)
+    with caplog.at_level("INFO"):
+        blocking.top_k_pairs(q, c, SPEC, "US")
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("pass A country US: chunk")]
+    assert len(lines) == 20 and lines[0].startswith("pass A country US: chunk 2/40, elapsed")
+    assert "ETA" in lines[-1] and "chunk 40/40" in lines[-1]
+    caplog.clear()
+    texts = pd.Series(["acme", "acme co", ""], index=[0, 1, 2])
+    with caplog.at_level("INFO"):
+        blocking.run_pass(texts, np.array([0], np.int32), np.array([1, 2], np.int32), SPEC, "US")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert "Stage pass A country US TF-IDF fit: start" in msgs
+    assert any(m.startswith("Stage pass A country US TF-IDF fit: end | runtime") and "peak RSS" in m for m in msgs)
+
 def test_pruned_scores_are_exact_cosines() -> None:
     """With pruning the returned scores are still the full-vector cosines."""
     q, c = _rand_csr(10, 30, 2), _rand_csr(50, 30, 3)
