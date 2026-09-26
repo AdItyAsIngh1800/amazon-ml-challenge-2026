@@ -89,13 +89,45 @@ def test_one_owner_keeps_best_s1() -> None:
 def test_threshold_grid_adapts_to_score_range() -> None:
     """Grid values are observed scores, deduplicated and ascending, for RRF-range and probability scores."""
     rrf = np.array([0.017, 0.05, 0.05, 0.18, 0.033], np.float32)
-    grid = decide.threshold_grid(rrf, 200)
+    grid = decide.threshold_grid(rrf, 200, step=0)
     assert grid == tuple(sorted(float(v) for v in set(rrf.tolist())))
+    assert set(grid) < set(decide.threshold_grid(rrf, 200))  # default adds the fixed step grid
     probs = np.linspace(0, 1, 10_001, dtype=np.float32)
-    grid = decide.threshold_grid(probs, 200)
+    grid = decide.threshold_grid(probs, 200, step=0)
     assert len(grid) == 200 and grid[0] == 0.0 and grid[-1] == 1.0 and set(grid) <= set(probs.tolist())
     with pytest.raises(ValueError):
         decide.threshold_grid(np.array([], np.float32), 200)
+
+
+def test_threshold_grid_covers_bimodal_probabilities() -> None:
+    """Near-0 bulk + few high probs: quantiles skip 0.02-0.99, the fixed step grid restores the optimum.
+
+    Positives score 0.3-0.5, top negatives 0.2-0.25: the best t lies in (0.25, 0.3],
+    which no quantile reaches. The grid search must equal brute force over every
+    distinct score (all distinct thresholds for ``score >= t``).
+    """
+    rng = np.random.default_rng(0)
+    n_s1 = 200
+    s1 = np.repeat(np.arange(n_s1, dtype=np.int32), 400)
+    score = rng.uniform(0.0, 0.01, len(s1)).astype(np.float32)  # bulk near 0
+    label = np.zeros(len(s1), np.int8)
+    first = np.arange(n_s1) * 400
+    score[first[:150]] = rng.uniform(0.3, 0.5, 150).astype(np.float32)  # true matches
+    label[first[:150]] = 1
+    score[first + 1] = rng.uniform(0.2, 0.25, n_s1).astype(np.float32)  # hard negatives
+    pairs = decide.Pairs(s1, np.arange(len(s1), dtype=np.int32), score, label)
+    n_truth = np.bincount(s1[label == 1], minlength=n_s1).astype(np.int64)
+    keep = np.ones(len(s1), dtype=bool)
+    old = decide.threshold_grid(score, 200, step=0)
+    grid = decide.threshold_grid(score, 200)
+    assert set(old) < set(grid) and float(np.float32(0.005)) in grid and float(np.float32(0.995)) in grid
+    assert not any(0.25 < t < 0.3 for t in old)
+    mx = decide.max_score_per_s1(pairs, keep, n_s1)
+    brute = max(float(decide.per_s1_scores(pairs, decide.select(pairs, keep, mx, float(t), te), n_truth).mean())
+                for t in np.unique(score) for te in (0.0, 0.3))
+    assert brute == 1.0
+    assert decide.grid_search(pairs, keep, n_truth, old)[2] < brute - 0.05
+    assert decide.grid_search(pairs, keep, n_truth, grid)[2] == pytest.approx(brute, abs=1e-12)
 
 
 @pytest.mark.parametrize("one_owner", [True, False])
@@ -281,7 +313,7 @@ def test_sorted_sweep_matches_exhaustive_grid(seed: int) -> None:
     pairs, n_truth, _ = _random_pairs(seed)
     n = len(n_truth)
     keep = decide.one_owner_mask(pairs, 60) if seed % 2 else np.ones(len(pairs.s1), dtype=bool)
-    grid = decide.threshold_grid(pairs.score, 200)
+    grid = decide.threshold_grid(pairs.score, 200, step=0)  # brute force is O(grid^2-3)
     mx = decide.max_score_per_s1(pairs, keep, n)
     best = (grid[0], 0.0, -1.0)
     for t in grid:  # v0 algorithm: ascending, strict improvement
@@ -300,7 +332,7 @@ def test_per_source_between_global_and_brute_force(seed: int) -> None:
     pairs, n_truth, is_s3 = _random_pairs(seed)
     n = len(n_truth)
     keep = np.ones(len(pairs.s1), dtype=bool)
-    grid = decide.threshold_grid(pairs.score, 200)
+    grid = decide.threshold_grid(pairs.score, 200, step=0)  # brute force is O(grid^2-3)
     start = decide.grid_search(pairs, keep, n_truth, grid)
     t2, t3, te, f = decide.per_source_search(pairs, keep, is_s3, n_truth, grid, start)
     mx = decide.max_score_per_s1(pairs, keep, n)
