@@ -1,13 +1,16 @@
 """Single entry point for the entity-resolution pipeline.
 
 Usage (from code/business_entity_resolution/):
-    python -m src.run_pipeline --stage {prep,block,feat,train,predict,decide,write,all}
+    python -m src.run_pipeline --stage {prep,block,feat,train,predict,decide,write,baseline,all}
         --split {train,test} --data-dir PATH --out-dir PATH
         [--artifacts-dir PATH] [--force] [--log-level INFO] [config overrides]
 
 Full reproduction: ``--split train --stage all`` then ``--split test --stage all``.
   train split, all = prep, block, feat, train, decide
   test split,  all = prep, block, feat, predict, write
+M1 rule baseline (not part of all): ``--stage baseline`` on either split writes
+oof_train / pred_test from blocking's rrf_score in place of train / predict;
+then decide with ``--decide-score-column score`` and write as usual.
 
 Each stage is skipped when all its outputs already exist (resume after a crash)
 unless ``--force``. Runtime and peak RSS are logged per stage. Stage artifacts
@@ -34,6 +37,7 @@ from src.logging_utils import setup_logging, track_stage
 logger = logging.getLogger(__name__)
 
 STAGE_ORDER: tuple[str, ...] = ("prep", "block", "feat", "train", "predict", "decide", "write")
+EXTRA_STAGES: tuple[str, ...] = ("baseline",)  # runnable by name only, never part of "all"
 RUN_META = "run_meta.json"
 
 
@@ -79,6 +83,9 @@ STAGES: dict[str, Stage] = {
         Stage("write", decide.OWNER, ("test",),
               lambda p, sp: [p.output_dir / "matching_results.tsv", p.output_dir / "candidate_pairs.tsv"],
               decide.run_stage),
+        Stage("baseline", decide.OWNER, BOTH,
+              lambda p, sp: [p.artifacts_dir / ("oof_train.parquet" if sp == "train" else "pred_test.parquet")],
+              decide.run_baseline),
     )
 }
 
@@ -98,7 +105,7 @@ def stages_for(stage: str, split: str) -> list[Stage]:
     """Resolve ``--stage`` for a split into an ordered list of stages.
 
     Args:
-        stage: A name from ``STAGE_ORDER`` or ``"all"``.
+        stage: A name from ``STAGE_ORDER`` / ``EXTRA_STAGES`` or ``"all"``.
         split: ``"train"`` or ``"test"``.
 
     Returns:
@@ -167,7 +174,7 @@ def run(stage: str, split: str, paths: Paths, force: bool = False) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """CLI definition."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stage", required=True, choices=(*STAGE_ORDER, "all"))
+    p.add_argument("--stage", required=True, choices=(*STAGE_ORDER, *EXTRA_STAGES, "all"))
     p.add_argument("--split", required=True, choices=BOTH)
     p.add_argument("--data-dir", type=Path, default=None, help="folder with train/ and test/")
     p.add_argument("--out-dir", type=Path, default=None, help="folder for the submission TSVs")
@@ -177,6 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decide-score-column", choices=("prob", "score"), default=None,
                    help=f"decision input column: model 'prob' or rule-baseline 'score' "
                         f"(default {config.DECIDE_SCORE_COLUMN})")
+    p.add_argument("--decision-config", type=Path, default=None,
+                   help="write (test): apply this decision_config.json instead of <artifacts>/decision_config.json")
     for flag, name in CONFIG_OVERRIDES.items():
         p.add_argument(f"--{flag.replace('_', '-')}", type=int, default=None,
                        help=f"override config.{name} (default {getattr(config, name)})")
@@ -200,6 +209,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.decide_score_column is not None:
         config.DECIDE_SCORE_COLUMN = args.decide_score_column
     logger.info("config.DECIDE_SCORE_COLUMN = %s", config.DECIDE_SCORE_COLUMN)
+    if args.decision_config is not None:
+        config.DECISION_CONFIG_PATH = args.decision_config.resolve()
+        logger.info("config.DECISION_CONFIG_PATH = %s", config.DECISION_CONFIG_PATH)
     command = "src.run_pipeline " + " ".join(sys.argv[1:] if argv is None else argv)
     with fulldata_lock(paths.data_dir, command):
         run(args.stage, args.split, paths, args.force)
