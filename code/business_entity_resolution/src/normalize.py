@@ -1,29 +1,38 @@
 """Stage `prep`: build records_{split}.parquet from the three source TSVs.
 
-*** PREP v0 (lead's stop-gap) ***
-Minimal, country-agnostic normalisation so blocking and features can start
-before Member 2's full version lands. Member 2 replaces the internals
-(legal-suffix extraction, abbreviation dictionaries, better acronyms) WITHOUT
-changing the output contract (contracts.RECORDS_COLUMNS and RECORDS_SCHEMA).
+*** PREP v1 *** Country-agnostic; dictionaries live in ``dictionaries.py``
+and every entry traces to EDA evidence (E7 / E10 / E11).
 
-v0 rules:
+Rules:
 - name_translit / addr_translit: raw text with Indic scripts romanised and
   Indic digits made ASCII (transliterate.transliterate), done first.
 - name_norm / addr_norm: from the transliterated text: NFKD, lowercase, strip Latin combining accents
   (U+0300-U+036F only, so Devanagari virama/nukta/vowel signs survive),
   "&" -> " and ", punctuation / symbols / whitespace / control chars -> space,
   spaces collapsed.
-- name_key = transliterate.phonetic_key(name_norm).
-- name_core = name_norm, legal_suffix = "" (placeholders).
-- name_acronym = first character of each name_norm token.
-- postal_tokens = every standalone 5-6 digit ASCII number in addr_norm.
+- name_core / legal_suffix (``split_legal``): runs of single letters are
+  joined ("l l p" -> "llp", "m s" -> "ms"), leading honorifics dropped,
+  dictionaries.LEGAL_PHRASES rewritten ("praa li" -> "private limited"); the
+  trailing run of legal tokens (dictionaries.SUFFIX_NOISE words may sit inside
+  it) and then any leading run are removed. legal_suffix = their canonical
+  forms (dictionaries.LEGAL_FORMS), de-duplicated, in dictionary order
+  (e.g. "private limited"); name_core = the remaining tokens with
+  dictionaries.NAME_ABBREVIATIONS applied. A name made only of legal tokens
+  keeps them all in name_core and gets an empty legal_suffix.
+- name_key = transliterate.phonetic_key(name_core).
+- name_acronym = first character of each name_core token.
+- addr_norm additionally gets dictionaries.ADDR_PHRASES / ADDR_ABBREVIATIONS
+  (long -> short: street -> st, near -> nr, texas -> tx, maharashtra -> mh).
+- postal_tokens = every standalone 5-6 digit number in addr_norm, plus
+  "ddd ddd" pairs joined ("600 001" -> "600001", E7 pattern b).
 - num_tokens = every standalone ASCII number in addr_norm.
-- landmark_flag = addr_norm has the word near / opp / opposite / behind / beside.
+- landmark_flag = addr_norm has a dictionaries.LANDMARK_WORDS word.
 - name_empty / addr_empty = normalised field is empty.
 - source = ID prefix (S1 / S2 / S3), checked against the file it came from.
 
 Memory: one source file at a time is held in memory; records are processed
-and written in chunks of PREP_CHUNK_ROWS rows.
+and written in chunks of PREP_CHUNK_ROWS rows. split_legal and the address
+token map are per-row Python (~5 us per record).
 """
 
 from __future__ import annotations
@@ -38,14 +47,13 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src import io_utils, transliterate
+from src import dictionaries, io_utils, transliterate
 from src.config import Paths
 
 logger = logging.getLogger(__name__)
 
 OWNER = "normalize.py (Member 2)"
 PREP_CHUNK_ROWS = 500_000
-LANDMARK_WORDS: tuple[str, ...] = ("near", "opp", "opposite", "behind", "beside")
 
 _STR = pa.string()
 _LIST = pa.list_(pa.string())
@@ -59,7 +67,8 @@ RECORDS_SCHEMA = pa.schema([
     ("name_translit", _STR), ("addr_translit", _STR), ("name_key", _STR),
 ])
 
-_LANDMARK_RE = r"(?:^| )(?:" + "|".join(LANDMARK_WORDS) + r")(?: |$)"
+_LANDMARK_RE = r"(?:^| )(?:" + "|".join(dictionaries.LANDMARK_WORDS + ("near", "opposite")) + r")(?: |$)"
+_LEGAL_RANK: dict[str, int] = {v: i for i, v in enumerate(dict.fromkeys(dictionaries.LEGAL_FORMS.values()))}
 
 
 @functools.cache
@@ -91,9 +100,26 @@ def normalize_text(s: pd.Series) -> pd.Series:
     return out.str.replace(r" +", " ", regex=True).str.strip()
 
 
-def postal_tokens(addr_norm: pd.Series) -> pd.Series:
-    """Standalone 5-6 digit numbers in a normalised address (lists of str)."""
-    return addr_norm.str.findall(r"(?<!\S)[0-9]{5,6}(?!\S)")
+def postal_tokens(addr_norm: pd.Series, join_pairs: bool = False) -> pd.Series:
+    """Standalone 5-6 digit numbers in a normalised address.
+
+    Args:
+        addr_norm: Normalised addresses.
+        join_pairs: Also add "ddd ddd" pairs joined ("600 001" -> "600001",
+            E7 pattern b), as prep does. False keeps the v0 rule that eda E7
+            reports as pattern (a).
+
+    Returns:
+        Lists of str, same index; joined pairs are appended without duplicates.
+    """
+    single = addr_norm.str.findall(r"(?<!\S)[0-9]{5,6}(?!\S)")
+    if not join_pairs:
+        return single
+    singles = single.tolist()
+    pairs = addr_norm.str.findall(r"(?<!\S)[0-9]{3} [0-9]{3}(?!\S)").tolist()
+    out = [list(dict.fromkeys([*a, *(p.replace(" ", "") for p in b)])) if b else a
+           for a, b in zip(singles, pairs, strict=True)]
+    return pd.Series(out, index=addr_norm.index, dtype=object)
 
 
 def num_tokens(addr_norm: pd.Series) -> pd.Series:
@@ -104,6 +130,75 @@ def num_tokens(addr_norm: pd.Series) -> pd.Series:
 def landmark_flag(addr_norm: pd.Series) -> pd.Series:
     """True where a normalised address contains a landmark word."""
     return addr_norm.str.contains(_LANDMARK_RE, regex=True).astype(bool)
+
+
+def _join_initials(tokens: list[str]) -> list[str]:
+    """Join runs of two or more single-letter tokens ("l l p" -> "llp")."""
+    out: list[str] = []
+    run: list[str] = []
+    for tok in [*tokens, ""]:
+        if len(tok) == 1 and tok.isalpha():
+            run.append(tok)
+            continue
+        if run:
+            out.extend(["".join(run)] if len(run) > 1 else run)
+            run = []
+        if tok:
+            out.append(tok)
+    return out
+
+
+def _split_one(name: str) -> tuple[str, str]:
+    """(name_core, legal_suffix) for one normalised name (see module docstring)."""
+    toks = _join_initials(name.split())
+    while len(toks) > 1 and toks[0] in dictionaries.HONORIFICS:
+        toks.pop(0)
+    while len(toks) > 1 and toks[-1] in dictionaries.DROP_IN_SUFFIX:
+        toks.pop()
+    legal_forms, noise = dictionaries.LEGAL_FORMS, dictionaries.SUFFIX_NOISE
+    i = len(toks)
+    while i > 0 and (toks[i - 1] in legal_forms or toks[i - 1] in noise):
+        i -= 1
+    tail = toks[i:]
+    legal = [t for t in tail if t in legal_forms]
+    core = toks[:i] + [t for t in tail if t not in legal_forms and t not in dictionaries.DROP_IN_SUFFIX] if legal else toks
+    j = 0
+    while j < len(core) and core[j] in legal_forms:
+        j += 1
+    legal += core[:j]
+    core = core[j:]
+    if not core:
+        return " ".join(dictionaries.NAME_ABBREVIATIONS.get(t, t) for t in toks), ""
+    suffix = sorted({legal_forms[t] for t in legal}, key=_LEGAL_RANK.__getitem__)
+    return " ".join(dictionaries.NAME_ABBREVIATIONS.get(t, t) for t in core), " ".join(suffix)
+
+
+def split_legal(name_norm: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Split normalised names into name_core and legal_suffix.
+
+    Args:
+        name_norm: Normalised (transliterated) names.
+
+    Returns:
+        ``(name_core, legal_suffix)`` string Series, same index.
+    """
+    s = name_norm
+    for pat, rep in dictionaries.LEGAL_PHRASES:
+        s = s.str.replace(pat, rep, regex=True)
+    pairs = [_split_one(n) for n in s.str.strip().tolist()]
+    core = pd.Series([c for c, _ in pairs], index=name_norm.index, dtype="str")
+    suffix = pd.Series([x for _, x in pairs], index=name_norm.index, dtype="str")
+    return core, suffix
+
+
+def canonical_address(addr_norm: pd.Series) -> pd.Series:
+    """Apply dictionaries.ADDR_PHRASES then ADDR_ABBREVIATIONS to normalised addresses."""
+    s = addr_norm
+    for pat, rep in dictionaries.ADDR_PHRASES:
+        s = s.str.replace(pat, rep, regex=True)
+    table = dictionaries.ADDR_ABBREVIATIONS
+    out = [" ".join(table.get(t, t) for t in a.split()) for a in s.tolist()]
+    return pd.Series(out, index=addr_norm.index, dtype="str")
 
 
 def acronym(name_norm: pd.Series) -> pd.Series:
@@ -133,7 +228,8 @@ def build_records(src: pd.DataFrame, source: str) -> pd.DataFrame:
     name_translit = transliterate.transliterate(src["business_name"])
     addr_translit = transliterate.transliterate(src["business_address"])
     name_norm = normalize_text(name_translit)
-    addr_norm = normalize_text(addr_translit)
+    addr_norm = canonical_address(normalize_text(addr_translit))
+    name_core, legal_suffix = split_legal(name_norm)
     return pd.DataFrame({
         "entity_id": src["entity_id"],
         "source": source,
@@ -141,18 +237,18 @@ def build_records(src: pd.DataFrame, source: str) -> pd.DataFrame:
         "name_raw": src["business_name"],
         "addr_raw": src["business_address"],
         "name_norm": name_norm,
-        "name_core": name_norm,
-        "legal_suffix": "",
-        "name_acronym": acronym(name_norm),
+        "name_core": name_core,
+        "legal_suffix": legal_suffix,
+        "name_acronym": acronym(name_core),
         "addr_norm": addr_norm,
-        "postal_tokens": postal_tokens(addr_norm),
+        "postal_tokens": postal_tokens(addr_norm, join_pairs=True),
         "num_tokens": num_tokens(addr_norm),
         "landmark_flag": landmark_flag(addr_norm),
         "name_empty": name_norm.eq(""),
         "addr_empty": addr_norm.eq(""),
         "name_translit": name_translit,
         "addr_translit": addr_translit,
-        "name_key": transliterate.phonetic_key(name_norm),
+        "name_key": transliterate.phonetic_key(name_core),
     })
 
 

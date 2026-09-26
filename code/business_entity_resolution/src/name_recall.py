@@ -10,6 +10,7 @@ miss). Columns: ``name_v0`` (prep v0 ``normalize_text(name_raw)``, the E9
 baseline) plus any records columns, default ``name_norm`` and ``name_key``;
 ``a+b+c`` means the text ``a | b | c`` (default ``name_norm+name_norm+name_key``,
 the recommended blocking text).
+With ``--postal`` also tabulates postal-token coverage (``postal_share``).
 Writes ``<artifacts-dir>/name_recall.md`` and logs the table at INFO.
 
 Memory: records (entity_id, source, country and the name columns) plus one
@@ -129,6 +130,41 @@ def name_recall(records: pd.DataFrame, gt: pd.DataFrame, columns: Sequence[str],
     return pd.DataFrame(rows).sort_values("country", kind="stable", ignore_index=True)
 
 
+def postal_share(records: pd.DataFrame, gt: pd.DataFrame) -> pd.DataFrame:
+    """Postal-token coverage per country (the E7 pair statistic).
+
+    Args:
+        records: One row per train record with str ``entity_id, country`` and
+            list-of-str ``postal_tokens``.
+        gt: Ground-truth long table (``io_utils.read_ground_truth_pairs``).
+
+    Returns:
+        One row per country: ``pct_records_with_token``, ``pct_pairs_both``
+        (both sides have a token) and ``pct_pairs_sharing`` (they share one),
+        as percentages.
+
+    Raises:
+        ValueError: If a required column is missing.
+    """
+    io_utils.require_columns(records.columns, ("entity_id", "country", "postal_tokens"), "postal_share")
+    toks = pd.Series([frozenset(t) for t in records["postal_tokens"]], index=records["entity_id"].to_numpy())
+    gt = gt[gt["cand_id"] != ""]
+    a = toks.reindex(gt["s1_id"].to_numpy()).to_numpy()
+    b = toks.reindex(gt["cand_id"].to_numpy()).to_numpy()
+    country = records.set_index("entity_id")["country"].reindex(gt["s1_id"].to_numpy()).to_numpy()
+    both = np.array([isinstance(x, frozenset) and isinstance(y, frozenset) and bool(x) and bool(y)
+                     for x, y in zip(a, b, strict=True)])
+    share = np.array([bool(ok and x & y) for ok, x, y in zip(both, a, b, strict=True)])
+    rows = []
+    for c in sorted(records["country"].unique()):
+        rm, pm = (records["country"] == c).to_numpy(), country == c
+        rows.append({"country": c,
+                     "pct_records_with_token": 100.0 * float(np.mean([len(t) > 0 for t in records.loc[rm, "postal_tokens"]])),
+                     "pct_pairs_both": 100.0 * float(both[pm].mean()),
+                     "pct_pairs_sharing": 100.0 * float(share[pm].mean())})
+    return pd.DataFrame(rows)
+
+
 def to_markdown(df: pd.DataFrame) -> str:
     """Render the recall table as a GitHub markdown table."""
     cols = list(df.columns)
@@ -145,13 +181,15 @@ def main() -> None:
     parser.add_argument("--artifacts-dir", type=Path, required=True, help="folder with records_train.parquet")
     parser.add_argument("--columns", nargs="+", default=list(DEFAULT_COLUMNS))
     parser.add_argument("--n-rank-s1", type=int, default=eda.N_RANK_S1, help="sampled S1 per country")
+    parser.add_argument("--postal", action="store_true", help="also write the postal-token table")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     paths = config.get_paths(data_dir=args.data_dir, artifacts_dir=args.artifacts_dir)
     setup_logging(args.log_level, paths.log_dir)
     stored = sorted({p for c in args.columns for p in c.split("+")} - {"name_v0"})
     rec = io_utils.load_parquet(paths.artifacts_dir / "records_train.parquet",
-                                columns=["entity_id", "source", "country", "name_raw", *stored])
+                                columns=["entity_id", "source", "country", "name_raw", *stored,
+                                         *(["postal_tokens"] if args.postal else [])])
     if "name_v0" in args.columns:
         rec["name_v0"] = normalize.normalize_text(rec["name_raw"])
     for c in args.columns:
@@ -160,6 +198,8 @@ def main() -> None:
             rec[c] = rec[parts[0]].str.cat([rec[p] for p in parts[1:]], sep=" | ")
     gt = io_utils.read_ground_truth_pairs(paths.data_dir / "train" / "train_ground_truth.tsv")
     table = to_markdown(name_recall(rec, gt, args.columns, args.n_rank_s1))
+    if args.postal:
+        table += "\n\n" + to_markdown(postal_share(rec, gt))
     out = paths.artifacts_dir / "name_recall.md"
     out.write_text(table + "\n", encoding="utf-8", newline="\n")
     for line in table.splitlines():
