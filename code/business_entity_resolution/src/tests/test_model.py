@@ -47,7 +47,7 @@ def _write_parts(folder: Path, n_s1: int, n_cand: int, n_parts: int, seed: int, 
 def trained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Paths, pd.DataFrame]:
     """Synthetic features_train trained with a row cap below the data size."""
     monkeypatch.setattr(config, "SHARED_ARTIFACTS_DIR", tmp_path / "shared")
-    monkeypatch.setattr(config, "TRAIN_MAX_ROWS", 2000, raising=False)
+    monkeypatch.setattr(config, "TRAIN_MAX_ROWS", 2000)
     monkeypatch.setattr(config, "LGBM_NUM_THREADS", 2)
     paths = Paths(tmp_path / "data", tmp_path / "art", tmp_path / "out")
     df = _write_parts(paths.artifacts_dir / "features_train", 400, 8, 3, seed=1, label=True)

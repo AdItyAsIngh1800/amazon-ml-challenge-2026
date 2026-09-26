@@ -47,7 +47,6 @@ OWNER = "model.py (lane feat)"
 MODEL_DIR = "models"
 IMPORTANCE_FILE = "feature_importance.tsv"
 NON_FEATURES: tuple[str, ...] = (*contracts.FEATURES_KEY_COLUMNS, "label")
-DEFAULT_TRAIN_MAX_ROWS = 10_000_000  # until config.TRAIN_MAX_ROWS exists (lane A)
 VALID_FRACTION = 0.1  # share of sampled training S1 groups held out for early stopping
 NUM_BOOST_ROUND = 3000
 EARLY_STOPPING_ROUNDS = 100
@@ -71,11 +70,6 @@ def _parts(folder: Path) -> list[Path]:
     if not parts:
         raise ValueError(f"{folder}: no part-*.parquet files")
     return parts
-
-
-def _train_max_rows() -> int:
-    """config.TRAIN_MAX_ROWS if the lead has added it, else DEFAULT_TRAIN_MAX_ROWS."""
-    return int(getattr(config, "TRAIN_MAX_ROWS", DEFAULT_TRAIN_MAX_ROWS))
 
 
 def group_folds(sizes: NDArray[np.int64], n_folds: int) -> NDArray[np.int8]:
@@ -193,7 +187,7 @@ def run_train(paths: Paths) -> None:
     # One sample of whole S1 groups serves every fold: each fold drops its own
     # S1 and keeps ~(n_folds-1)/n_folds of the sample, i.e. ~TRAIN_MAX_ROWS pairs.
     rng = np.random.default_rng(config.SEED)
-    cap = _train_max_rows() * config.N_FOLDS // (config.N_FOLDS - 1)
+    cap = config.TRAIN_MAX_ROWS * config.N_FOLDS // (config.N_FOLDS - 1)
     perm = rng.permutation(n_s1)
     sampled = np.zeros(n_s1, dtype=bool)
     sampled[perm[np.cumsum(sizes[perm]) <= cap]] = True

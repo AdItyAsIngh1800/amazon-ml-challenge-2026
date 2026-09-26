@@ -68,6 +68,8 @@ FEATURE_CHUNK_PAIRS: int = 300_000
 RAPIDFUZZ_WORKERS: int = -1  # all cores, for rapidfuzz.process.cdist
 
 N_FOLDS: int = 5
+# Model (owner: model.py): training pairs per fold (whole S1 groups sampled).
+TRAIN_MAX_ROWS: int = 10_000_000
 
 # Decision layer (owner: decide.py). "prob" reads model OOF / test predictions;
 # "score" reads a rule-baseline score column from the same files until the

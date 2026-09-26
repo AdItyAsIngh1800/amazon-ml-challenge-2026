@@ -60,11 +60,14 @@ def test_artifacts_tied_to_data_dir(tmp_path: Path) -> None:
 
 
 def test_cli_overrides_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """--block-top-k sets config.BLOCK_TOP_K before stages run."""
+    """--block-top-k / --train-max-rows set config before stages run."""
     monkeypatch.setattr(config, "BLOCK_TOP_K", config.BLOCK_TOP_K)  # restored after test
+    monkeypatch.setattr(config, "TRAIN_MAX_ROWS", config.TRAIN_MAX_ROWS)
     art = tmp_path / "artifacts"
     art.mkdir()
     (art / "records_train.parquet").touch()
     run_pipeline.main(["--stage", "prep", "--split", "train", "--data-dir", str(tmp_path / "d"),
-                       "--artifacts-dir", str(art), "--out-dir", str(tmp_path / "o"), "--block-top-k", "7"])
+                       "--artifacts-dir", str(art), "--out-dir", str(tmp_path / "o"), "--block-top-k", "7",
+                       "--train-max-rows", "1234"])
     assert config.BLOCK_TOP_K == 7
+    assert config.TRAIN_MAX_ROWS == 1234
