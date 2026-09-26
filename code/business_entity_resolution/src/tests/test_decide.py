@@ -244,3 +244,189 @@ def test_baseline_without_rrf_score_names_lane_b(train_paths: Paths) -> None:
     with pytest.raises(ValueError, match="rrf_score.*Lane B"):
         decide.run_baseline(train_paths, "train")
     assert not (train_paths.artifacts_dir / "oof_train.parquet.tmp").exists()
+
+
+# --------------------------------------------------------------------------- decide v1
+
+
+def _random_pairs(seed: int, n_s1: int = 40, n_cand: int = 60, n_pairs: int = 300) -> tuple[
+        decide.Pairs, np.ndarray, np.ndarray]:
+    """Random labelled pairs with coarse (tie-heavy) scores; returns pairs, n_truth, is_s3 per pair."""
+    rng = np.random.default_rng(seed)
+    key = np.unique(rng.integers(0, n_s1 * n_cand, n_pairs))
+    s1, cand = (key // n_cand).astype(np.int32), (key % n_cand).astype(np.int32)
+    score = (rng.integers(0, 12, len(key)) / 11).astype(np.float32)
+    label = (rng.random(len(key)) < score * 0.8).astype(np.int8)
+    missed = rng.integers(0, 2, n_s1) * (rng.random(n_s1) < 0.2)  # truths blocking missed
+    n_truth = np.bincount(s1[label == 1], minlength=n_s1).astype(np.int64) + missed
+    return decide.Pairs(s1, cand, score, label), n_truth, cand % 3 == 0
+
+
+def _macro(pairs: decide.Pairs, sel: np.ndarray, n_truth: np.ndarray) -> float:
+    """Macro F0.5 of a selection, scored per S1 with evaluate.f05_single (independent of decide)."""
+    assert pairs.label is not None
+    total = 0.0
+    for i in range(len(n_truth)):
+        mine = pairs.s1 == i
+        pred = {int(c) for c in pairs.cand[mine & sel]}
+        found = {int(c) for c in pairs.cand[mine & (pairs.label == 1)]}
+        truth = found | {-k - 1 for k in range(int(n_truth[i]) - len(found))}  # missed truths: unmatched IDs
+        total += evaluate.f05_single({str(c) for c in pred}, {str(c) for c in truth})
+    return total / len(n_truth)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_sorted_sweep_matches_exhaustive_grid(seed: int) -> None:
+    """Incremental sweep = scoring every (t, t_empty) on the grid, same winner incl. tie-breaking."""
+    pairs, n_truth, _ = _random_pairs(seed)
+    n = len(n_truth)
+    keep = decide.one_owner_mask(pairs, 60) if seed % 2 else np.ones(len(pairs.s1), dtype=bool)
+    grid = decide.threshold_grid(pairs.score, 200)
+    mx = decide.max_score_per_s1(pairs, keep, n)
+    best = (grid[0], 0.0, -1.0)
+    for t in grid:  # v0 algorithm: ascending, strict improvement
+        for te in (0.0, *grid):
+            f = float(decide.per_s1_scores(pairs, decide.select(pairs, keep, mx, t, te), n_truth).mean())
+            if f > best[2] + 1e-12:
+                best = (t, te, f)
+    t, te, f = decide.grid_search(pairs, keep, n_truth, grid)
+    assert (t, te) == best[:2] and f == pytest.approx(best[2], abs=1e-12)
+    assert f == pytest.approx(_macro(pairs, decide.select(pairs, keep, mx, t, te), n_truth), abs=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_per_source_between_global_and_brute_force(seed: int) -> None:
+    """Coordinate descent: >= global threshold, <= exhaustive (t_s2, t_s3, t_empty), and its F is real."""
+    pairs, n_truth, is_s3 = _random_pairs(seed)
+    n = len(n_truth)
+    keep = np.ones(len(pairs.s1), dtype=bool)
+    grid = decide.threshold_grid(pairs.score, 200)
+    start = decide.grid_search(pairs, keep, n_truth, grid)
+    t2, t3, te, f = decide.per_source_search(pairs, keep, is_s3, n_truth, grid, start)
+    mx = decide.max_score_per_s1(pairs, keep, n)
+    brute = max(float(decide.per_s1_scores(pairs, decide.select(pairs, keep, mx, np.where(is_s3, b, a), e),
+                                           n_truth).mean())
+                for a in grid for b in grid for e in (0.0, *grid))
+    assert start[2] - 1e-12 <= f <= brute + 1e-12
+    sel = decide.select(pairs, keep, mx, np.where(is_s3, np.float32(t3), np.float32(t2)), te)
+    assert f == pytest.approx(_macro(pairs, sel, n_truth), abs=1e-12)
+
+
+def test_per_source_finds_separate_thresholds() -> None:
+    """S2 matches score 0.9 vs S2 non-matches 0.6; S3 matches 0.5 vs non-matches 0.2: needs t_s2 > t_s3."""
+    s1 = np.array([0, 0, 1, 1, 2, 3], np.int32)
+    cand = np.array([0, 1, 2, 3, 4, 5], np.int32)
+    score = np.array([0.9, 0.6, 0.5, 0.2, 0.6, 0.2], np.float32)
+    label = np.array([1, 0, 1, 0, 0, 0], np.int8)
+    is_s3 = np.array([False, False, True, True, False, True])
+    pairs, n_truth = decide.Pairs(s1, cand, score, label), np.array([1, 1, 0, 0], np.int64)
+    keep = np.ones(6, dtype=bool)
+    grid = decide.threshold_grid(score, 200)
+    start = decide.grid_search(pairs, keep, n_truth, grid)
+    t2, t3, _, f = decide.per_source_search(pairs, keep, is_s3, n_truth, grid, start)
+    assert start[2] < 1.0 and f == 1.0 and t2 > 0.6 and 0.2 < t3 <= 0.5
+
+
+def _expected_naive(pairs: decide.Pairs, keep: np.ndarray) -> set[int]:
+    """Per-S1 expected-F0.5 prefix choice written as a plain loop."""
+    chosen: set[int] = set()
+    for i in np.unique(pairs.s1[keep]):
+        idx = [int(j) for j in np.flatnonzero(keep & (pairs.s1 == i))]
+        idx.sort(key=lambda j: -float(pairs.score[j]))  # stable: file order among ties
+        p = [float(pairs.score[j]) for j in idx]
+        best_k, best = 0, float(np.prod([1 - q for q in p]))
+        for k in range(1, len(p) + 1):
+            e = 1.25 * sum(p[:k]) / (0.25 * sum(p) + k)
+            if e > best + 1e-12:
+                best_k, best = k, e
+        chosen |= set(idx[:best_k])
+    return chosen
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 10_000])
+def test_expected_f05_matches_naive(monkeypatch: pytest.MonkeyPatch, chunk: int) -> None:
+    """Vectorised, chunked selection = plain per-S1 loop, for chunks smaller than one S1 and larger than all."""
+    monkeypatch.setattr(config, "DECIDE_EXPECTED_CHUNK_PAIRS", chunk)
+    for seed in range(3):
+        pairs, n_truth, _ = _random_pairs(seed)
+        pairs = decide.Pairs(pairs.s1, pairs.cand, np.random.default_rng(seed).random(len(pairs.s1)).astype(np.float32)
+                             ** 3, pairs.label)
+        keep = decide.one_owner_mask(pairs, 60)
+        sel = decide.expected_f05_select(pairs, keep, len(n_truth))
+        assert set(np.flatnonzero(sel).tolist()) == _expected_naive(pairs, keep)
+
+
+def test_expected_f05_simple_cases() -> None:
+    """Lone weak candidate -> empty; lone strong -> taken; one strong + one weak -> strong only."""
+    pairs = decide.Pairs(s1=np.array([0, 1, 2, 2], np.int32), cand=np.arange(4, dtype=np.int32),
+                         score=np.array([0.3, 0.8, 0.95, 0.1], np.float32), label=None)
+    assert decide.expected_f05_select(pairs, np.ones(4, dtype=bool), 3).tolist() == [False, True, True, False]
+
+
+def test_calibration_table() -> None:
+    """Equal-width bins: counts, mean probability and positive rate per bin; empty bins dropped."""
+    prob = np.array([0.05, 0.05, 0.95, 0.95, 0.95, 0.95, 1.0], np.float32)
+    label = np.array([0, 1, 1, 1, 1, 0, 1], np.int8)
+    t = decide.calibration_table(prob, label)
+    assert t["bin"].tolist() == ["[0.0,0.1)", "[0.9,1.0)"] and t["n"].tolist() == [2, 5]
+    assert t["pos_rate"].tolist() == pytest.approx([0.5, 0.8]) and t["mean_prob"].iloc[1] == pytest.approx(0.96)
+
+
+def test_auto_one_owner_and_per_source_end_to_end(train_paths: Paths) -> None:
+    """--decide-one-owner-auto + --decide-method per_source: choice recorded, write applies t_s2 / t_s3."""
+    paths = train_paths
+    _make_split(paths, "test", TEST)
+    io_utils.save_parquet(pd.DataFrame(PRED, columns=["s1_id", "cand_id", "prob"]),
+                          paths.artifacts_dir / "pred_test.parquet")
+    try:
+        _main(paths, "decide", "train", "--decide-method", "per_source", "--decide-one-owner-auto")
+        cfg = json.loads((paths.artifacts_dir / "decision_config.json").read_text(encoding="utf-8"))
+        assert cfg["method"] == "per_source" and cfg["one_owner_auto"] is True
+        by = cfg["f05_by_one_owner"]
+        assert cfg["one_owner"] is (by["true"] >= by["false"]) and cfg["train_f05"] == max(by.values())
+        assert cfg["train_f05"] >= _brute_force_best(cfg["one_owner"]) - 1e-6
+        cfg.update(t_s2=0.9, t_s3=0.5, t_empty=0.0, one_owner=False)  # S2 needs 0.9, S3 needs 0.5
+        (paths.artifacts_dir / "decision_config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        _main(paths, "write", "test")
+    finally:
+        config.DECIDE_METHOD, config.DECIDE_ONE_OWNER_AUTO = "threshold", False
+    m = (paths.output_dir / "matching_results.tsv").read_text(encoding="utf-8").splitlines()[1:]
+    assert m == ["S1-10\tS2-1,S3-1", "S1-11\t", "S1-12\t"]
+
+
+def test_default_decision_config_unchanged(train_paths: Paths) -> None:
+    """Flags off: decision_config.json has exactly the v0 keys."""
+    decide.run_decide(train_paths, log_row=False)
+    cfg = json.loads((train_paths.artifacts_dir / "decision_config.json").read_text(encoding="utf-8"))
+    assert list(cfg) == ["t", "t_empty", "one_owner", "score_column", "train_f05"]
+
+
+def test_expected_f05_needs_probabilities(train_paths: Paths, monkeypatch: pytest.MonkeyPatch) -> None:
+    """expected_f05 on a rule-baseline score is refused before any work."""
+    monkeypatch.setattr(config, "DECIDE_METHOD", "expected_f05")
+    monkeypatch.setattr(config, "DECIDE_SCORE_COLUMN", "score")
+    with pytest.raises(ValueError, match="needs probabilities"):
+        decide.run_decide(train_paths)
+
+
+def test_compare_stage_table(train_paths: Paths) -> None:
+    """compare writes one row per method x one-owner with overall / singleton / country columns."""
+    _main(train_paths, "compare", "train")
+    t = pd.read_csv(train_paths.artifacts_dir / "decide_compare.tsv", sep="\t")
+    assert t["variant"].tolist() == ["threshold+one_owner", "per_source+one_owner", "expected_f05+one_owner",
+                                     "threshold", "per_source", "expected_f05"]
+    assert {"overall", "singleton", "non_singleton", "country=US", "country=India"} <= set(t.columns)
+    assert t.loc[0, "overall"] == pytest.approx(_brute_force_best(True), abs=1e-4)
+    assert t.loc[3, "overall"] == pytest.approx(_brute_force_best(False), abs=1e-4)
+    assert (t["overall"][[1, 4]].to_numpy() >= t["overall"][[0, 3]].to_numpy() - 1e-9).all()
+    assert not (train_paths.artifacts_dir / "decision_config.json").exists()
+
+
+def test_write_with_expected_f05_config(test_paths: Paths) -> None:
+    """write applies method=expected_f05 per S1: S1-10 keeps its two strong candidates, S1-12 (0.4, 0.1) goes empty."""
+    cfg_file = test_paths.artifacts_dir / "decision_config.json"
+    cfg = json.loads(cfg_file.read_text(encoding="utf-8")) | {"method": "expected_f05"}
+    cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+    decide.run_stage(test_paths, "test")
+    m = (test_paths.output_dir / "matching_results.tsv").read_text(encoding="utf-8").splitlines()[1:]
+    assert m == ["S1-10\tS2-1,S3-1", "S1-11\t", "S1-12\t"]

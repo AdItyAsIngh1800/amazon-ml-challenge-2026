@@ -35,3 +35,8 @@ FEATURES_KEY_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id")
 OOF_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id", "fold", "prob", "label")
 PRED_COLUMNS: tuple[str, ...] = ("s1_id", "cand_id", "prob")
 DECISION_CONFIG_KEYS: tuple[str, ...] = ("t", "t_empty", "one_owner", "score_column", "train_f05")
+# Optional decision_config keys (decide v1); absent = the v0 global-threshold rule:
+#   method ("threshold" | "per_source" | "expected_f05"), t_s2 / t_s3 (per_source;
+#   "t" then holds the global-threshold start point), one_owner_auto (bool),
+#   f05_by_one_owner ({"true": F, "false": F}). expected_f05 ignores t / t_empty.
+DECISION_CONFIG_OPTIONAL_KEYS: tuple[str, ...] = ("method", "t_s2", "t_s3", "one_owner_auto", "f05_by_one_owner")
