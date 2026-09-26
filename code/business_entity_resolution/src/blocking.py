@@ -3,6 +3,9 @@
 Reads:  <artifacts>/records_{split}.parquet (contracts.RECORDS_COLUMNS)
 Writes: <artifacts>/candidates_{split}.parquet (contracts.CANDIDATES_COLUMNS)
         <artifacts>/blocking_recall_{split}.tsv (train only, recall report)
+        <artifacts>/blocking_capped_out_{split}.parquet (train only: ``s1_id,
+        cand_id`` of true pairs in the uncapped union but beyond the cap, for
+        blocking_misses.py)
 
 Passes are data (``PASSES``): each is a TF-IDF vectorizer over one or more
 records columns joined with " | " (``pass_text``), fitted per country on that country's S1+S2+S3 records, returning the
@@ -514,6 +517,24 @@ def _chunk_recall(
         evaluate.logger.setLevel(level)
 
 
+def _capped_out_true(union: pd.DataFrame, truth: pd.DataFrame, cap: int, n_records: int) -> pd.DataFrame:
+    """True pairs of one S1 chunk that are in the union but beyond the cap.
+
+    Args:
+        union: ``union_passes`` output for the chunk (int32 ``s1, cand``, ``union_rank``).
+        truth: ``_truth_index`` output (int64 ``s1, cand``, sorted by s1).
+        cap: Candidates kept per S1.
+        n_records: Total records (for the int64 pair key).
+
+    Returns:
+        int64 ``s1, cand`` of the capped-out true pairs.
+    """
+    out = union.loc[union["union_rank"] > cap, ["s1", "cand"]].astype(np.int64)
+    t = truth[truth["cand"] >= 0]  # singletons have cand -1
+    true_key = t["s1"].to_numpy() * n_records + t["cand"].to_numpy()
+    return out[np.isin(out["s1"].to_numpy() * n_records + out["cand"].to_numpy(), true_key)]
+
+
 def _write_part(union: pd.DataFrame, path: Path) -> None:
     """Spill capped union rows (index columns, pass columns) to a parquet part."""
     union.drop(columns="union_rank").to_parquet(path, index=False)
@@ -627,6 +648,7 @@ def run_stage(paths: Paths, split: str) -> None:
     truth = _truth_index(paths, split, rec["entity_id"])
     report = _Report()
     parts: list[Path] = []
+    capped_out: list[pd.DataFrame] = []
     cap = config.MAX_CANDIDATES_PER_S1
     n_records = len(rec)
 
@@ -646,6 +668,9 @@ def run_stage(paths: Paths, split: str) -> None:
             union = union_passes(sub, n_records)
             if truth is not None:
                 _chunk_recall(report, str(country), union, np.arange(lo, hi + 1), truth, ids)
+                ts = truth["s1"].to_numpy()
+                part_truth = truth.iloc[np.searchsorted(ts, lo): np.searchsorted(ts, hi, side="right")]
+                capped_out.append(_capped_out_true(union, part_truth, cap, n_records))
             part = parts_dir / f"part-{len(parts):05d}.parquet"
             _write_part(union[union["union_rank"] <= cap], part)
             parts.append(part)
@@ -658,3 +683,8 @@ def run_stage(paths: Paths, split: str) -> None:
     logger.info("Wrote %s: %d pairs, %.1f per S1 (cap %d)", out, n_rows, n_rows / max(n_s1, 1), cap)
     if truth is not None:
         _log_report(report, art / f"blocking_recall_{split}.tsv", split)
+        co = pd.concat(capped_out, ignore_index=True) if capped_out else pd.DataFrame({"s1": [], "cand": []})
+        pd.DataFrame({"s1_id": ids.take(pa.array(co["s1"].to_numpy(np.int64))).to_numpy(zero_copy_only=False),
+                      "cand_id": ids.take(pa.array(co["cand"].to_numpy(np.int64))).to_numpy(zero_copy_only=False)},
+                     ).to_parquet(art / f"blocking_capped_out_{split}.parquet", index=False)
+        logger.info("%d true pairs in the uncapped union were cut by the cap", len(co))
