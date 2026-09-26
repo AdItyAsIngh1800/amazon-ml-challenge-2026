@@ -52,7 +52,7 @@ from src.config import Paths
 
 logger = logging.getLogger(__name__)
 
-OWNER = "normalize.py (Member 2)"
+OWNER = "normalize.py (lane norm)"
 PREP_CHUNK_ROWS = 500_000
 
 _STR = pa.string()

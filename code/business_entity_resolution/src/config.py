@@ -27,6 +27,28 @@ import numpy as np
 # code/business_entity_resolution/src/config.py -> repo root is parents[3].
 REPO_ROOT: Path = Path(__file__).resolve().parents[3]
 
+
+def _main_checkout(root: Path) -> Path:
+    """Main working tree when ``root`` is a git worktree (its ``.git`` is a file), else ``root``.
+
+    A worktree's ``.git`` file reads ``gitdir: <main>/.git/worktrees/<name>``.
+    """
+    git = root / ".git"
+    if git.is_file():
+        text = git.read_text(encoding="utf-8").strip()
+        if text.startswith("gitdir:"):
+            gitdir = Path(text.split(":", 1)[1].strip())
+            if gitdir.parent.name == "worktrees":
+                return gitdir.parent.parent.parent
+    return root
+
+
+# Shared across all lane worktrees: the full dataset, the full-data lock and
+# the experiment log live in the main checkout.
+MAIN_ROOT: Path = _main_checkout(REPO_ROOT)
+SHARED_ARTIFACTS_DIR: Path = MAIN_ROOT / "artifacts"
+FULL_DATA_DIR: Path = Path(os.environ.get("BER_FULL_DATA_DIR", str(MAIN_ROOT / "dataset"))).expanduser().resolve()
+
 SEED: int = 42
 PEAK_RAM_TARGET_GB: float = 10.0
 
@@ -46,6 +68,13 @@ FEATURE_CHUNK_PAIRS: int = 300_000
 RAPIDFUZZ_WORKERS: int = -1  # all cores, for rapidfuzz.process.cdist
 
 N_FOLDS: int = 5
+
+# Decision layer (owner: decide.py). "prob" reads model OOF / test predictions;
+# "score" reads a rule-baseline score column from the same files until the
+# model exists (run_pipeline --decide-score-column).
+DECIDE_SCORE_COLUMN: str = "prob"
+DECIDE_ONE_OWNER: bool = True  # EDA E3: 0 matched IDs shared between S1 lists
+DECIDE_T_GRID: tuple[float, ...] = tuple(round(0.05 * i, 2) for i in range(1, 20))  # 0.05 .. 0.95
 
 
 def _performance_cores() -> int:

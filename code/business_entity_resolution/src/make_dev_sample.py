@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from src import config, io_utils
+from src.fulldata_lock import fulldata_lock
 from src.logging_utils import setup_logging, track_stage
 
 logger = logging.getLogger(__name__)
@@ -111,7 +113,7 @@ def main() -> None:
     paths = config.get_paths(data_dir=args.data_dir)
     setup_logging(args.log_level, paths.log_dir)
     out_dir = args.out_dir.resolve() if args.out_dir else paths.artifacts_dir / "dev_sample"
-    with track_stage("make_dev_sample"):
+    with fulldata_lock(paths.data_dir, "src.make_dev_sample " + " ".join(sys.argv[1:])), track_stage("make_dev_sample"):
         build_dev_sample(paths.data_dir, out_dir, args.frac, args.seed)
 
 
