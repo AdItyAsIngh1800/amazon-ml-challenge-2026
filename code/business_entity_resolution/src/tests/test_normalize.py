@@ -1,16 +1,17 @@
-"""Tests for normalize.py prep v0."""
+"""Tests for normalize.py prep v1."""
 
 from __future__ import annotations
 
 import unicodedata
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from src import contracts, io_utils, normalize
+from src import contracts, io_utils, name_recall, normalize
 from src.config import Paths
 
 
@@ -144,3 +145,16 @@ def test_postal_pairs_joined_only_on_request() -> None:
     addr = pd.Series(["chennai 600 001", "560001 560001", "no pin"], dtype="str")
     assert normalize.postal_tokens(addr).tolist() == [[], ["560001", "560001"], []]
     assert normalize.postal_tokens(addr, join_pairs=True).tolist() == [["600001"], ["560001", "560001"], []]
+
+
+def test_postal_share_handles_parquet_arrays() -> None:
+    """name_recall.postal_share counts records/pairs; token lists may be numpy arrays (parquet)."""
+    rec = pd.DataFrame({
+        "entity_id": ["S1-1", "S2-1", "S1-2", "S2-2"],
+        "country": ["India", "India", "US", "US"],
+        "postal_tokens": [np.array(["600001"]), np.array(["600001"]), np.array([], dtype=str), np.array(["12345"])],
+    })
+    gt = pd.DataFrame({"s1_id": ["S1-1", "S1-2"], "cand_id": ["S2-1", "S2-2"]})
+    out = name_recall.postal_share(rec, gt).set_index("country")
+    assert out.loc["India", "pct_pairs_sharing"] == 100.0 and out.loc["US", "pct_pairs_both"] == 0.0
+    assert out.loc["US", "pct_records_with_token"] == 50.0

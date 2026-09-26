@@ -159,7 +159,7 @@ def postal_share(records: pd.DataFrame, gt: pd.DataFrame) -> pd.DataFrame:
     for c in sorted(records["country"].unique()):
         rm, pm = (records["country"] == c).to_numpy(), country == c
         rows.append({"country": c,
-                     "pct_records_with_token": 100.0 * float(np.mean([bool(t) for t in records.loc[rm, "postal_tokens"]])),
+                     "pct_records_with_token": 100.0 * float(np.mean([len(t) > 0 for t in records.loc[rm, "postal_tokens"]])),
                      "pct_pairs_both": 100.0 * float(both[pm].mean()),
                      "pct_pairs_sharing": 100.0 * float(share[pm].mean())})
     return pd.DataFrame(rows)
