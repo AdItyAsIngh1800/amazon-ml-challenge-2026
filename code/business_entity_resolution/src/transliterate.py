@@ -59,8 +59,9 @@ record (no country logic).
 
 The vowel drop is what links cross-script pairs (loanwords like "silvar
 treding" for "silver trading"); used alone the key loses same-script
-precision, so blocking should vectorise ``name_norm + " | " + name_key``
-(dev-sample India R@20 0.676 -> 0.693, US flat; see the PR table).
+precision, so blocking should vectorise ``name_norm | name_norm | name_key``
+(name_norm counted twice; dev-sample R@20 vs prep v0: India 0.661 -> 0.683,
+US 0.829 -> 0.835; see the PR table).
 
 Memory/speed: vectorised over a pandas Series; the per-character Python work
 runs only on strings that contain an Indic character.

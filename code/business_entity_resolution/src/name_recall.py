@@ -8,7 +8,8 @@ the same seeded sample of S1 with matches ranks each true match among ALL
 same-country S2/S3 records by cosine (``eda.true_match_ranks``; cosine 0 =
 miss). Columns: ``name_v0`` (prep v0 ``normalize_text(name_raw)``, the E9
 baseline) plus any records columns, default ``name_norm`` and ``name_key``;
-``a+b`` means the text ``a + " | " + b`` (default ``name_norm+name_key``).
+``a+b+c`` means the text ``a | b | c`` (default ``name_norm+name_norm+name_key``,
+the recommended blocking text).
 Writes ``<artifacts-dir>/name_recall.md`` and logs the table at INFO.
 
 Memory: records (entity_id, source, country and the name columns) plus one
@@ -33,7 +34,7 @@ from src.logging_utils import setup_logging, track_stage
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COLUMNS: tuple[str, ...] = ("name_v0", "name_norm", "name_key", "name_norm+name_key")
+DEFAULT_COLUMNS: tuple[str, ...] = ("name_v0", "name_norm", "name_key", "name_norm+name_norm+name_key")
 KS: tuple[int, ...] = (10, 20, 50)
 
 
