@@ -286,7 +286,7 @@ test.
 - **Threshold grid:** the union of 200 score quantiles (for rank-fusion scores) and a
   fixed 0.005-step grid on (0, 1). The quantile-only grid had no values between 0.02 and
   0.99 on probabilities, because almost all pairs score near 0 (PR #20); the fixed grid
-  closes that gap (PR #21, open at the time of writing). The search sorts pairs once and
+  closes that gap (PR #21, merged). The search sorts pairs once and
   sweeps the grid incrementally (O(n log n)), and unit tests check it against brute force.
 - **Calibration** (mini OOF): expected calibration error 0.0003 (PR #18).
 
