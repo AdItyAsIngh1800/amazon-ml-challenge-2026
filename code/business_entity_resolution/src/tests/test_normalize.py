@@ -80,15 +80,16 @@ def test_run_stage_writes_contract(tmp_path: Path) -> None:
     assert r.loc["S2-1", "name_empty"] and r.loc["S2-1", "addr_empty"]
     assert r.loc["S3-1", "name_norm"] == "na" and bool(r.loc["S3-1", "landmark_flag"])
     assert df.loc[df["entity_id"] == "S2-2", "postal_tokens"].map(list).tolist() == [["75001"]]
-    assert r.loc["S2-2", "name_core"] == "cafe lune sarl" and r.loc["S2-2", "legal_suffix"] == ""
-    assert r.loc["S1-1", "name_acronym"] == "bri"
+    assert r.loc["S2-2", "name_core"] == "cafe lune" and r.loc["S2-2", "legal_suffix"] == "sarl"
+    assert r.loc["S1-1", "name_acronym"] == "br"  # from name_core "b retail"
     # transliterated before normalisation; Indic digits feed postal tokens
     assert r.loc["S3-2", "name_translit"] == "shree raam tredars"
     assert r.loc["S3-2", "name_norm"] == "shree raam tredars"
     assert r.loc["S3-2", "name_key"] == "sr rm trdrs"
     assert r.loc["S3-2", "addr_translit"] == "mumbaee 400001"
     assert df.loc[df["entity_id"] == "S3-2", "postal_tokens"].map(list).tolist() == [["400001"]]
-    assert r.loc["S1-1", "name_translit"] == "B+ Retail Inc" and r.loc["S1-1", "name_key"] == "b rtl ink"
+    assert r.loc["S1-1", "name_translit"] == "B+ Retail Inc" and r.loc["S1-1", "name_key"] == "b rtl"
+    assert r.loc["S1-1", "legal_suffix"] == "inc" and r.loc["S3-2", "name_core"] == "sri raam tredars"
     assert schema.equals(normalize.RECORDS_SCHEMA)
     assert schema.field("postal_tokens").type == pa.list_(pa.string())
     assert schema.field("landmark_flag").type == pa.bool_()
@@ -103,3 +104,43 @@ def test_bad_id_prefix_raises(tmp_path: Path) -> None:
     io_utils.write_source_tsv(bad, paths.data_dir / "train" / "train_source3.tsv")
     with pytest.raises(ValueError, match="S9-1"):
         normalize.run_stage(paths, "train")
+
+
+@pytest.mark.parametrize(("name", "core", "suffix"), [
+    ("silver trading pvt ltd", "silver trading", "private limited"),
+    ("sky estate praa li", "sky estate", "private limited"),  # Gujarati Pvt. Ltd.
+    ("abc praaivet limitet", "abc", "private limited"),  # transliterated forms
+    ("l l p creative engineering", "creative engineering", "llp"),  # dotted + leading
+    ("limited yamutech sciences center", "yamutech sciences center", "limited"),
+    ("bansal traders llp center", "bansal traders center", "llp"),  # noise after legal
+    ("smt pamtl holdings", "pamtl holdings", ""),  # honorific
+    ("m s shree ram traders", "sri ram traders", ""),  # M/s + shree -> sri
+    ("heartcenter com", "heartcenter", ""),
+    ("xyz public limited", "xyz", "public limited"),
+    ("abc limited limited", "abc", "limited"),
+    ("abc and co", "abc", "co"),
+    ("club de foot sas", "club de foot", "sas"),
+    ("cafe et cie", "cafe", "cie"),
+    ("delhi public school", "delhi public school", ""),  # legal word mid-name kept
+    ("private limited", "private limited", ""),  # nothing left -> keep all
+])
+def test_split_legal(name: str, core: str, suffix: str) -> None:
+    """Legal suffix from the trailing (then leading) legal run; core is the rest."""
+    c, s = normalize.split_legal(pd.Series([name], dtype="str"))
+    assert (c.iloc[0], s.iloc[0]) == (core, suffix)
+
+
+def test_canonical_address() -> None:
+    """Long forms -> short; multi-word state names first."""
+    got = normalize.canonical_address(pd.Series([
+        "12 main street near temple road uttar pradesh",
+        "5 rue de la paix", "west virginia 25301", "2803 la loma drive rancho cordova california",
+    ], dtype="str")).tolist()
+    assert got == ["12 main st nr temple rd up", "5 r de la paix", "wv 25301", "2803 la loma dr rancho cordova ca"]
+
+
+def test_postal_pairs_joined_only_on_request() -> None:
+    """E7 pattern b ("600 001") is joined in prep; the v0 rule is unchanged."""
+    addr = pd.Series(["chennai 600 001", "560001 560001", "no pin"], dtype="str")
+    assert normalize.postal_tokens(addr).tolist() == [[], ["560001", "560001"], []]
+    assert normalize.postal_tokens(addr, join_pairs=True).tolist() == [["600001"], ["560001", "560001"], []]
