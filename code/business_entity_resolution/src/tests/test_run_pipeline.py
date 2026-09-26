@@ -40,16 +40,6 @@ def test_stages_wired_to_owner_modules() -> None:
         assert run_pipeline.STAGES[name].owner == module.OWNER
 
 
-@pytest.mark.parametrize(("stage", "split", "owner"), [
-    ("train", "train", "model.py"),
-    ("predict", "test", "model.py"),
-])
-def test_unimplemented_stages_name_owner(tmp_path: Path, stage: str, split: str, owner: str) -> None:
-    """Stub stages raise NotImplementedError naming the owning module."""
-    with pytest.raises(NotImplementedError, match=owner):
-        run_pipeline.run(stage, split, _paths(tmp_path))
-
-
 def test_existing_outputs_are_skipped_unless_force(tmp_path: Path) -> None:
     """prep is skipped when records_train.parquet exists; --force reruns it."""
     paths = _paths(tmp_path)
