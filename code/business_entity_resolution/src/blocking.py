@@ -4,11 +4,11 @@ Reads:  <artifacts>/records_{split}.parquet (contracts.RECORDS_COLUMNS)
 Writes: <artifacts>/candidates_{split}.parquet (contracts.CANDIDATES_COLUMNS)
         <artifacts>/blocking_recall_{split}.tsv (train only, recall report)
 
-Passes are data (``PASSES``): each is a TF-IDF vectorizer over one records
-column, fitted per country on that country's S1+S2+S3 records, returning the
+Passes are data (``PASSES``): each is a TF-IDF vectorizer over one or more
+records columns joined with " | " (``pass_text``), fitted per country on that country's S1+S2+S3 records, returning the
 top-K S2/S3 records per S1 within the same country (EDA E5: 100% of true pairs
 share the country label, so there is no cross-country pass). Adding a pass
-(e.g. Pass T on ``name_key``) is one ``PassSpec`` entry; it adds the columns
+is one ``PassSpec`` entry; it adds the columns
 ``pass_<name>_score`` / ``pass_<name>_rank``. Contract passes with no spec
 (C, F) are written as all-NaN columns.
 
@@ -22,7 +22,8 @@ dependency, so plain scipy):
    by an nnz upper bound (sum of posting lengths per row), so each product
    holds at most ``BLOCK_MAX_PRODUCT_NNZ`` non-zeros whatever the data size.
 3. Per S1 the ``rescore_k`` best partial scores are rescored with the exact
-   cosine of the full vectors and the top ``top_k`` kept.
+   cosine of the full vectors and the top K kept (the pass's ``top_k``, or
+   ``config.BLOCK_TOP_K`` for every pass when that is set).
 
 Output columns (one row per (S1, candidate) pair, at most
 ``config.MAX_CANDIDATES_PER_S1`` per S1, kept by reciprocal rank fusion of
@@ -31,6 +32,7 @@ the pass ranks, see ``union_passes``):
     pass_<X>_score (float32 cosine, NaN if pass X did not return the pair);
     pass_<X>_rank (float32, 1 = best within the S1, NaN if not returned);
     n_passes (int8); best_block_score (float32, max pass score);
+    rrf_score (float32, reciprocal rank fusion value the cap ranks by);
     rev_n_s1 (int32, S1s that kept this candidate), rev_rank (int32, 1 = this
     S1 has the candidate's highest best_block_score), rev_gap (float32, that
     highest score minus this S1's score). Reverse features use blocking scores
@@ -68,11 +70,12 @@ class PassSpec:
 
     Attributes:
         name: Pass letter; output columns are ``pass_<name>_score/_rank``.
-        column: records column to vectorise (empty strings are skipped).
+        columns: records columns joined with " | " into the pass text; rows
+            empty in every column are skipped.
         analyzer: ``"char"`` (character n-grams) or ``"word"`` (whitespace
             tokens of the normalised text).
         ngram: n-gram length.
-        top_k: Candidates kept per S1.
+        top_k: Candidates kept per S1 (overridden by ``config.BLOCK_TOP_K``).
         max_df: Query n-grams with document frequency above this share of the
             candidate pool are dropped from the S1 side ...
         min_query_terms: ... unless they are among the row's this-many rarest.
@@ -80,7 +83,7 @@ class PassSpec:
     """
 
     name: str
-    column: str
+    columns: tuple[str, ...]
     analyzer: str
     ngram: int
     top_k: int
@@ -92,9 +95,13 @@ class PassSpec:
 # Settings from the dev-sample sweep (see PR): name char3 max_df/min terms
 # 0.001/4 keeps ~99% of the best recall at half the product size; address word
 # tokens beat address char 3-grams (India 0.900 vs 0.853, US 0.928 vs 0.883).
+# Pass A text is name_norm | name_norm | name_key (Lane C, experiment norm-001:
+# beats name_key alone and name_norm alone on both countries). The 3x longer
+# text needs min_query_terms 16: at 4, pruning drops the key n-grams and pass A
+# recall falls below name_norm alone (US 0.752 vs 0.792); at 16 it is 0.867.
 PASSES: tuple[PassSpec, ...] = (
-    PassSpec("A", "name_norm", "char", 3, top_k=50, max_df=0.001, min_query_terms=4),
-    PassSpec("B", "addr_norm", "word", 1, top_k=50, max_df=0.003, min_query_terms=3),
+    PassSpec("A", ("name_norm", "name_norm", "name_key"), "char", 3, top_k=50, max_df=0.001, min_query_terms=16),
+    PassSpec("B", ("addr_norm",), "word", 1, top_k=50, max_df=0.003, min_query_terms=3),
 )
 CONTRACT_PASSES: tuple[str, ...] = ("A", "B", "C", "F")
 BLOCK_MAX_PRODUCT_NNZ: int = 50_000_000  # ~0.6 GB of float32 + int32 per product
@@ -103,9 +110,11 @@ REPORT_CAPS: tuple[int, ...] = (20, 30, 50, 80)
 # dev sample union@50 pair recall is 0.977 with RRF vs 0.951 by max score
 # (name and address cosines are on different scales).
 RRF_K: float = 10.0
-EXPERIMENT_ID = "block-v0"
+EXPERIMENT_ID = "block-v1"
 
-RECORD_COLUMNS: tuple[str, ...] = ("entity_id", "source", "country", *sorted({p.column for p in PASSES}))
+RECORD_COLUMNS: tuple[str, ...] = (
+    "entity_id", "source", "country", *sorted({c for p in PASSES for c in p.columns}),
+)
 _GB = 1024**3
 
 
@@ -212,6 +221,28 @@ def _chunk_bounds(row_nnz: NDArray[np.float64], budget: int, max_rows: int) -> l
     return bounds
 
 
+def pass_top_k(spec: PassSpec) -> int:
+    """Effective K of a pass: ``config.BLOCK_TOP_K`` if set, else ``spec.top_k``."""
+    return spec.top_k if config.BLOCK_TOP_K is None else config.BLOCK_TOP_K
+
+
+def pass_text(rec: pd.DataFrame, spec: PassSpec) -> pd.Series:
+    """Pass input text: ``spec.columns`` joined with " | " (as name_recall.py).
+
+    Args:
+        rec: Records with every column in ``spec.columns`` (str).
+
+    Returns:
+        str Series aligned with ``rec``; "" where every column is empty, so
+        those rows are skipped by the pass.
+    """
+    cols = list(spec.columns)
+    text = rec[cols[0]]
+    for c in cols[1:]:
+        text = text + " | " + rec[c]
+    return text.where((rec[cols] != "").any(axis=1), "")
+
+
 def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
     NDArray[np.int32], NDArray[np.int32], NDArray[np.float32], NDArray[np.int32]
 ]:
@@ -223,13 +254,16 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
     Args:
         q: L2-normalised query rows (S1), float32 CSR, shape (n_q, V).
         c: L2-normalised candidate rows, float32 CSR, shape (n_c, V).
-        spec: Pass settings (top_k, max_df, min_query_terms, rescore_k).
+        spec: Pass settings (top_k, max_df, min_query_terms, rescore_k);
+            ``config.BLOCK_TOP_K`` replaces ``top_k`` when not None.
 
     Returns:
         ``(q_idx, c_idx, score, rank)``: local row indices into ``q`` and
         ``c``, exact cosine and 1-based rank, sorted by (q_idx, rank). Pairs
         with cosine 0 are never returned; ties break on the lower ``c_idx``.
     """
+    top_k = pass_top_k(spec)
+    rescore_k = max(spec.rescore_k, top_k)
     empty = (np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32), np.empty(0, np.int32))
     if q.shape[0] == 0 or c.shape[0] == 0:
         return empty
@@ -243,7 +277,7 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
     for a, b in chunks:
         prod = (qp[a:b] @ ct).tocsr()
         max_nnz = max(max_nnz, prod.nnz)
-        rows, cols = _best_per_row(prod, spec.rescore_k)
+        rows, cols = _best_per_row(prod, rescore_k)
         del prod
         if not len(rows):
             continue
@@ -253,7 +287,7 @@ def top_k_pairs(q: sp.csr_matrix, c: sp.csr_matrix, spec: PassSpec) -> tuple[
         rows, cols, exact = rows[order], cols[order], exact[order]
         starts = np.r_[0, np.flatnonzero(np.diff(rows)) + 1]
         rank = np.arange(len(rows)) - np.repeat(starts, np.diff(np.r_[starts, len(rows)])) + 1
-        keep = (rank <= spec.top_k) & (exact > 0)
+        keep = (rank <= top_k) & (exact > 0)
         out.append((rows[keep].astype(np.int32), cols[keep].astype(np.int32), exact[keep], rank[keep].astype(np.int32)))
     logger.info("Pass %s: %d S1 x %d candidates, %d product chunks, max product nnz %.1fM, RSS %.2f GB",
                 spec.name, q.shape[0], c.shape[0], len(chunks), max_nnz / 1e6, psutil.Process().memory_info().rss / _GB)
@@ -295,7 +329,7 @@ def run_pass(texts: pd.Series, s1_pos: NDArray[np.int32], cand_pos: NDArray[np.i
     """Run one pass for one country.
 
     Args:
-        texts: The pass column for the country's records, indexed by global
+        texts: The pass text (``pass_text``) for the country's records, indexed by global
             record index (str; empty = no signal, skipped on both sides).
         s1_pos: Global record indices of the country's S1 (ascending).
         cand_pos: Global record indices of the country's S2/S3.
@@ -329,9 +363,10 @@ def union_passes(results: dict[str, PassResult], n_records: int) -> pd.DataFrame
     Returns:
         One row per unique (s1, cand): int32 ``s1, cand``; float32
         ``pass_<X>_score, pass_<X>_rank`` for every pass in ``results`` (NaN
-        when absent); int8 ``n_passes``; float32 ``best_block_score``; int32
-        ``union_rank`` (1 = best in the S1 by reciprocal rank fusion
-        sum_X 1 / (RRF_K + pass_X_rank), ties by best score then cand).
+        when absent); int8 ``n_passes``; float32 ``best_block_score``; float32
+        ``rrf_score`` (reciprocal rank fusion sum_X 1 / (RRF_K + pass_X_rank));
+        int32 ``union_rank`` (1 = best in the S1 by ``rrf_score``, ties by best
+        score then cand; ranked on the float64 sum before the float32 cast).
         Sorted by (s1, union_rank).
     """
     keys = {n: r.s1.astype(np.int64) * n_records + r.cand for n, r in results.items()}
@@ -349,6 +384,7 @@ def union_passes(results: dict[str, PassResult], n_records: int) -> pd.DataFrame
         out[f"pass_{n}_rank"] = rank
     out["n_passes"] = (~np.isnan(scores)).sum(axis=1).astype(np.int8)
     out["best_block_score"] = np.fmax.reduce(scores, axis=1)
+    out["rrf_score"] = rrf.astype(np.float32)
     order = np.lexsort((out["cand"].to_numpy(), -out["best_block_score"].to_numpy(), -rrf, out["s1"].to_numpy()))
     out = out.iloc[order].reset_index(drop=True)
     s1 = out["s1"].to_numpy()
@@ -398,7 +434,7 @@ def _output_schema() -> pa.Schema:
               ("country_match", pa.bool_())]
     for n in names:
         fields += [(f"pass_{n}_score", pa.float32()), (f"pass_{n}_rank", pa.float32())]
-    fields += [("n_passes", pa.int8()), ("best_block_score", pa.float32()),
+    fields += [("n_passes", pa.int8()), ("best_block_score", pa.float32()), ("rrf_score", pa.float32()),
                ("rev_n_s1", pa.int32()), ("rev_rank", pa.int32()), ("rev_gap", pa.float32())]
     return pa.schema(fields)
 
@@ -416,7 +452,7 @@ def _load_records(path: Path) -> pd.DataFrame:
         if not (pd.api.types.is_string_dtype(rec[col]) or pd.api.types.is_object_dtype(rec[col])):
             raise ValueError(f"{path}: column {col} must be str, got {rec[col].dtype}")
     rec = rec.sort_values(["country", "source", "entity_id"], kind="stable", ignore_index=True)
-    for col in {p.column for p in PASSES}:
+    for col in sorted({c for p in PASSES for c in p.columns}):
         n_empty = int(rec[col].eq("").sum())
         if n_empty:
             logger.warning("%d records with empty %s are skipped by passes on that column", n_empty, col)
@@ -545,11 +581,11 @@ def _log_report(report: _Report, path: Path, split: str) -> None:
         final = df[(df["country"] == "ALL") & (df["variant"] == "union")]
     at = df.set_index(["country", "variant"])["pair_recall"]
     notes = "; ".join(f"{c} {v}={at[(c, v)]:.4f}" for c, v in at.index if c != "ALL" or v.startswith("pass_"))
-    passes = ", ".join(f"{p.name}={p.column}/{p.analyzer}{p.ngram} K={p.top_k} max_df={p.max_df} "
+    passes = ", ".join(f"{p.name}={'|'.join(p.columns)}/{p.analyzer}{p.ngram} K={pass_top_k(p)} max_df={p.max_df} "
                        f"min_terms={p.min_query_terms}" for p in PASSES)
     experiment_log.log_experiment(
         EXPERIMENT_ID, "block",
-        f"blocking v0 on {split}: passes {passes}; cap {config.MAX_CANDIDATES_PER_S1} by RRF (k={RRF_K:g})",
+        f"blocking v1 on {split}: passes {passes}; cap {config.MAX_CANDIDATES_PER_S1} by RRF (k={RRF_K:g})",
         pair_recall=float(final["pair_recall"].iloc[0]) if not final.empty else None,
         avg_cands_per_s1=float(final["avg_cands_per_s1"].iloc[0]) if not final.empty else None,
         notes=notes,
@@ -599,7 +635,7 @@ def run_stage(paths: Paths, split: str) -> None:
         is_s1 = (grp["source"] == "S1").to_numpy()
         s1_pos, cand_pos = pos[is_s1].astype(np.int32), pos[~is_s1].astype(np.int32)
         logger.info("Country %s: %d S1, %d S2/S3", country, len(s1_pos), len(cand_pos))
-        results = {p.name: run_pass(grp[p.column], s1_pos, cand_pos, p) for p in PASSES}
+        results = {p.name: run_pass(pass_text(grp, p), s1_pos, cand_pos, p) for p in PASSES}
         gc.collect()
         for a in range(0, len(s1_pos), config.BLOCK_CHUNK_S1_ROWS):
             lo, hi = int(s1_pos[a]), int(s1_pos[min(a + config.BLOCK_CHUNK_S1_ROWS, len(s1_pos)) - 1])
