@@ -122,16 +122,22 @@ python -m src.run_pipeline --split test  --stage write    $D
 Hardware: MacBook Air, Apple M4 (4 performance + 6 efficiency cores), 16 GB RAM,
 macOS 26.6, Python 3.13.13. Every stage is designed to stay under 10 GB peak RSS.
 
-| Stage | Train split | Test split | Source |
+Measured on the full data (2026-09-26/27 run). Train blocked a stratified 50% of train
+S1 (`--block-s1-fraction 0.5`, 1,103,410 S1, 55.2M pairs); test covers all 1,732,544 S1
+(86.6M pairs).
+
+| Stage | Train split | Test split | Notes |
 |---|---|---|---|
-| prep | 257 s, 1.9 GB | 252 s, 1.8 GB | measured, full data |
-| block | ~50–60 min, ~3–4 GB | ~40–50 min, ~3–4 GB | projected from the dev sample (10% of train S1: 345 s, 2.5 GB) |
-| feat | ~20 min, ~5 GB (~110M pairs) | ~15–20 min, ~5 GB | projected from the mini sample (1.1M pairs: 11.6 s, 1.0 GB; 95k pairs/s) |
-| train | not yet measured at full scale | — | mini sample: 35 s, 1.3 GB (5 folds, ≤ 10M sampled pairs per fold at full scale) |
-| predict | — | not yet measured | |
-| compare (optional) | ~6–8 min, ~6 GB | — | projected from a 4M-pair synthetic benchmark (6 variants) |
-| decide | ~2–5 min + parquet load, ~6 GB | — | projected from a 4M-pair synthetic benchmark (110M pairs at ~13 bytes/pair + sort buffers) |
-| write | — | ~5 min, ~5 GB | projected (test ≤ 85M pairs) |
+| prep | 257 s, 1.86 GB | 252 s, 1.78 GB | |
+| block | 15,886 s (4.4 h), 6.48 GB | 35,211 s (9.8 h), 5.17 GB | train: 50% of S1, `--block-workers 4`; test: 1 worker |
+| feat | 998 s, 8.05 GB | 1,894 s, 5.59 GB | 69 features |
+| train | 4,459 s (1.2 h), 7.57 GB | — | 5 folds, 12.5M sampled pairs |
+| predict | — | 15,371 s (4.3 h), 0.94 GB | 5 fold models × 86.6M pairs |
+| compare (optional) | 180 s, 4.40 GB | — | 6 decision variants |
+| decide | 42 s, 5.89 GB | — | |
+| write | — | 95 s, 4.51 GB | includes the validator |
+
+Peak RSS over all stages: 8.05 GB (train feat).
 
 To refresh this table after a run: `grep -h "Stage .*: end" ../../artifacts/logs/*.log`.
 
