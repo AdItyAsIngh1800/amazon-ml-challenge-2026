@@ -9,7 +9,9 @@
 > the data it was measured on. The **dev sample** is 10% of train S1 (220,683 S1); the
 > **mini sample** is ~1% (22,068 S1). Both overstate precision (fewer competing
 > candidates), so every decision threshold in the submission is tuned on full train.
-> Anything not yet measured on full data is marked **TODO**.
+> Full-data numbers come from the 2026-09-27 run (`artifacts/overnight2_nohup.out`,
+> `artifacts/block_test_nohup.out`); the train side blocked a stratified 50% of train S1
+> (`--block-s1-fraction 0.5`, Section 3). Anything still open is marked **TODO**.
 
 ---
 
@@ -101,8 +103,14 @@ Section 4.4.
   - The candidates contract reserves passes C (postal) and F; they are not implemented and
     are written as all-NaN.
 - **Candidate pairs generated:** dev sample 11.03M pairs for 220,683 S1 (50.0 per S1);
-  mini sample 1,103,400 pairs for 22,068 S1. Full train and test: **TODO** (expected ~110M
-  train pairs at 50 per S1).
+  mini sample 1,103,400 pairs for 22,068 S1. Full train (50% of S1, below): 55,170,500
+  pairs for 1,103,410 S1; full test: 86,627,200 pairs for 1,732,544 S1 (50.0 per S1).
+- **Train S1 fraction.** Full-train blocking runs on a deterministic 50% of train S1,
+  stratified by country × singleton (`--block-s1-fraction 0.5`: 1,103,410 of 2,206,821
+  S1), with 4 worker processes (`--block-workers 4`). The candidate pool (all S2/S3 of the
+  country) is not subsampled, so each kept S1 faces the full competition. The other half
+  gets no candidates and is left out of training, decide and every train-side report.
+  Test blocking always covers every S1.
 - **How you ensured true matches were not lost:**
   - *No full similarity matrix.* Query-side pruning keeps each S1 row's n-grams with
     document frequency ≤ `max_df` × pool plus always its `min_query_terms` rarest ones
@@ -136,7 +144,22 @@ v1 = Pass A on `name_norm | name_norm | name_key`, `min_query_terms` 16, prep v1
 | Union @50, US | 0.9843 | 0.9902 | +0.0059 |
 | S1 fully covered @50 | 93.48% | 94.96% | +1.48 pp |
 
-Full-train recall: **TODO** (target ≥ 98%).
+**Full-train pair recall** (50% of train S1: 1,103,410 S1, 3,818,728 true pairs;
+experiment row block-v1 2026-09-27T08:39:03, `blocking_recall_train.tsv`):
+
+| Variant | ALL | India | US |
+|---|---|---|---|
+| Pass A | 0.6859 | 0.6222 | 0.7284 |
+| Pass B | 0.8812 | 0.8515 | 0.9011 |
+| Union, uncapped (~97 per S1) | 0.9625 | 0.9427 | 0.9758 |
+| Union @20 | 0.9313 | 0.9098 | 0.9457 |
+| Union @30 | 0.9431 | 0.9213 | 0.9577 |
+| **Union @50 (shipped)** | **0.9535** | **0.9323** | **0.9677** |
+| Union @80 | 0.9602 | 0.9399 | 0.9738 |
+| S1 fully covered @50 | 87.75% | 82.98% | 90.93% |
+
+This is below the 98% target and below the dev-sample 0.9826; Section 5.3 explains the
+gap. Raising the cap from 50 to 80 would add only +0.0067.
 
 **Miss analysis (PR #15, mini sample, block-v1; experiment row block-v1 17:31).** 530 of
 76,280 true pairs (0.69%) are not candidates: India 444 of 30,434 (1.46%), US 86 of 45,846
@@ -151,8 +174,26 @@ Full-train recall: **TODO** (target ≥ 98%).
 | Other | 75 | 14.2% |
 
 Cross-script pairs are 58% of India misses, so Indic-side transliteration/phonetics is the
-largest remaining recall lever; the cap costs 0.13 pp of recall. Full-train breakdown:
-**TODO** (`python -m src.blocking_misses`).
+largest remaining recall lever; the cap costs 0.13 pp of recall.
+
+**Full-train miss analysis** (`python -m src.blocking_misses`,
+`artifacts/blocking_misses/report.txt`; same 50% S1 subset). 177,381 of 3,818,728 true
+pairs (4.65%) are not candidates: India 103,470 of 1,529,471 (6.77%), US 73,911 of
+2,289,257 (3.23%); S2 80,805 (4.38%), S3 96,576 (4.90%).
+
+| Primary cause | India | US | All | Share of misses |
+|---|---|---|---|---|
+| Cross-script names (Latin S1, Indic candidate) | 42,228 | 0 | 42,228 | 23.8% |
+| Empty address on one side | 11,464 | 24,286 | 35,750 | 20.2% |
+| Pushed out by the 50 cap | 15,837 | 18,424 | 34,261 | 19.3% |
+| Low name and address similarity (both < 0.3) | 621 | 157 | 778 | 0.4% |
+| Other | 33,320 | 31,044 | 64,364 | 36.3% |
+
+At full scale the cap costs 0.90 pp of recall (34,261 pairs) against 0.13 pp on the mini
+sample, and "other" misses (median name similarity 0.57, address 0.43: moderately similar
+pairs that simply rank below 50 closer-looking distractors in each pass) become the
+largest group. Cross-script names still account for 44.5% of India misses (46,026 flagged
+pairs).
 
 ---
 
@@ -224,17 +265,24 @@ scratch; no pretrained model). Parameters: learning rate 0.05, 127 leaves,
 `deterministic=True`, seed 42, fixed thread count.
 
 - **Folds:** 5-fold GroupKFold by S1 over **all** train S1, so no S1 appears in both the
-  training and the held-out part of a fold.
+  training and the held-out part of a fold (all *blocked* train S1 on full data).
 - **Out-of-fold predictions:** every train pair is predicted by the model of its held-out
   fold, so the OOF file covers all ~110M train pairs and the decision layer is tuned on
-  exactly the pair distribution the test predictions will have.
+  exactly the pair distribution the test predictions will have. On full train this is
+  55.2M pairs (the blocked 50% of S1).
 - **Training-row cap:** one shared sample of whole S1 groups
   (`config.TRAIN_MAX_ROWS` = 10M × 5/4 pairs) is binned once; each fold trains on its
-  ~10M-row subset. This bounds peak RAM (projected ~5.5 GB at full scale; PR #14).
+  ~10M-row subset. This bounds peak RAM (measured 7.57 GB at full scale; PR #14).
 - **Test:** mean probability of the 5 fold models.
 
 Mini sample (row feat-002, PR #14): OOF AUC 0.99998; best iterations 176–195 per fold.
-Full train: **TODO**.
+Full train (row feat-model-20260927-101003): 55,170,500 pairs (1,103,410 S1, 3,641,347
+positives); a shared sample of 12.5M pairs (250,000 S1 groups), ~9.0M training / ~1.0M
+early-stopping pairs per fold; best iterations 2374, 2562, 2393, 2767, 2196 (validation
+log-loss 0.0086–0.0087); **OOF AUC 0.99979**. Top features by gain: `rrf_score`,
+`grp_addr_tok_cos_z`, `addr_norm_token_set`, `num_overlap`, `name_core_partial`,
+`name_core_ratio`. OOF calibration: expected calibration error 0.0003, every 0.1-bin's
+positive rate within 0.023 of its mean probability.
 
 ### 4.4 Leakage audit and LOCO (PR #20, mini sample)
 
@@ -300,35 +348,104 @@ Mini sample, model v0 OOF (rows A-decide-20260926-1739*, -205011, -205447; PR #1
 
 On the same mini sample, the rule baseline (`rrf_score` only, no model) scores 0.9358 with
 the same decision layer. The final rule is chosen on full train with `--stage compare`:
-**TODO**.
+**TODO** (the submitted M2 uses `threshold` + one-owner, Section 5).
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** full-train OOF F0.5: **TODO**, by segment:
+### 5.1 Full-train OOF F0.5
 
-| Segment | F0.5 |
-|---|---|
-| Overall | TODO |
-| Singleton S1 | TODO |
-| Non-singleton S1 | TODO |
-| US | TODO |
-| India | TODO |
-| LOCO mean | TODO |
+`threshold` rule, one-owner on, tuned on the full-train OOF probabilities (row
+A-decide-20260927-101046): **t = 0.69, t_empty = 0.73**. Scored over the 1,103,410
+blocked train S1; blocking misses count as false negatives.
+
+| Segment | S1 | F0.5 |
+|---|---|---|
+| **Overall** | 1,103,410 | **0.9597** |
+| Singleton S1 | 61,624 | 0.9555 |
+| Non-singleton S1 | 1,041,786 | 0.9600 |
+| US | 661,816 | 0.9654 |
+| India | 441,594 | 0.9512 |
+| LOCO mean | — | TODO |
+
+Without the one-owner rule the best F0.5 is 0.9593 (t = 0.705, t_empty = 0.75), so the
+rule adds +0.0004. On test, the same config gives 5,528,207 matches for 1,732,544 S1 and
+110,078 empty lists (6.4%, against 5.6% singletons in train).
+
+### 5.2 Leaderboard
+
+| Submission | Description | Leaderboard F0.5 |
+|---|---|---|
+| M1 | Rule baseline: `rrf_score` + decision layer, no model (dev F0.5 0.888) | 0.677 |
+| M2 | LightGBM model + `threshold` + one-owner (this document) | **TODO** |
+
+### 5.3 Dev sample vs. full data
+
+Every metric drops from the dev sample to full data: blocking recall @50 0.9826 (dev) vs
+0.9535 (full train), and M1 0.888 (dev) vs 0.677 (leaderboard). The cause is denser
+competition at full scale. The dev sample keeps 10% of train S1 with all their true
+matches plus *random* S2/S3 distractors (`make_dev_sample.py`), so its pool is ~10% of the
+full pool and holds few near-duplicates of any S1's true matches. At full scale:
+
+- **Blocking:** the TF-IDF passes rank each S1 against every S2/S3 of its country (3.8M US,
+  4.7M India records in test). Many more similar-looking businesses compete for the 50
+  slots: Pass A recall falls from 0.8125 (dev) to 0.6859, cap push-outs rise from 0.13 pp
+  to 0.90 pp, and moderately similar true pairs ("other" misses) are outranked.
+- **Decision:** more high-scoring distractors per S1 cost precision, which F0.5 weighs
+  twice. M1 ranks by `rrf_score` alone, which cannot tell a true match from a close
+  distractor, so it lost most (0.888 → 0.677). Test is denser still (5.75 S2/S3 per S1
+  vs 4.68 in train) and adds unseen France.
+- **Model:** the model's full-train OOF F0.5 (0.9597) is below its mini-sample score
+  (0.9922) for the same reason, but the drop is far smaller than M1's because its features
+  (name/address similarity, group context, reverse features) separate close distractors.
+
+Thresholds are therefore tuned only on full train, never on a sample.
+
+### 5.4 Error analysis
 
 - **Decision-variant comparison (full train, `decide_compare.tsv`):** TODO (threshold /
   per_source / expected_f05 × one-owner on/off).
 - **Common false positives (wrong merges):** TODO (from full-train OOF; describe patterns
   only, no raw records).
-- **Common false negatives (missed matches):** TODO (split into blocking misses, see
-  Section 3, and decision/model misses).
+- **Common false negatives (missed matches):** 4.65% of true pairs are never scored
+  because blocking missed them (Section 3: cross-script names, empty addresses, the cap,
+  moderately similar pairs outranked by distractors). A breakdown of the remaining
+  decision/model misses: TODO.
 
 ---
 
 ## 6. Conclusion
 
-TODO (after the full-data run).
+The pipeline runs end to end on full data on a 16 GB laptop (peak RSS 8.05 GB, README
+runtime table) and reaches full-train OOF F0.5 0.9597 (US 0.9654, India 0.9512,
+singletons 0.9555). Blocking is the main ceiling: 4.65% of true pairs are never scored.
+
+**Limitations**
+
+- **Cross-script recall.** 42,228 of 177,381 full-train blocking misses (23.8%) are
+  Latin S1 names whose true candidate is written in an Indic script. Transliteration
+  helps inside Pass A, but these pairs still lose to Latin-script distractors.
+- **The 50-candidate cap** pushes out 34,261 true pairs (0.90 pp recall) at full scale.
+- **50% train fraction.** Full-train blocking, training and threshold tuning used half of
+  the train S1 to fit the time budget. The candidate pool was not reduced, so recall and
+  precision are measured under full competition, but the one-owner rule was validated
+  with only half of the competing S1 present: an S2/S3 ID can be claimed only by blocked
+  S1, so conflicts between S1 are undercounted and its measured gain (+0.0004) may differ
+  from its effect on test, where every S1 is blocked.
+- **Runtime.** Test blocking took 35,211 s (9.8 h, single worker) and predict 15,371 s
+  (4.3 h, 5 fold models × 86.6M pairs); both dominate the end-to-end time.
+
+**Future work**
+
+- **Pass T:** a dedicated transliterated-name blocking pass (`name_translit` / `name_key`
+  of both sides, restricted to pairs where one side is Indic-script) to recover the
+  cross-script misses, fused into the RRF cap.
+- An adaptive cap (more slots for S1 with many close candidates) instead of a flat 50.
+- Blocking all train S1 (fraction 1.0) with `--block-workers` to validate one-owner under
+  the test-time competition.
+- Faster predict: fewer trees (early-stopped refit on all data instead of 5 fold models),
+  or LightGBM `num_threads` tuned for inference.
 
 ---
 
@@ -366,7 +483,8 @@ python -m src.make_submission --team-name TEAM $D                               
 ```
 
 Each stage skips if its outputs exist (`--force` reruns it) and logs runtime and peak RSS.
-The decision method is set to the full-train winner of `--stage compare` (TODO). `write`
+The decision method is set to the full-train winner of `--stage compare` (TODO; M2 uses
+`threshold` + one-owner). `write`
 runs `utils/validate_submission.py` and publishes the TSVs only on `PASS`. The README
 gives stage-by-stage commands, data layout, overrides and measured runtimes. Hardware: MacBook
 Air (Apple M4, 16 GB); every stage is designed for ≤ 10 GB peak RAM. Tests:
@@ -385,7 +503,7 @@ TODO charts:
 
 | Component | Version | Licence | Use |
 |---|---|---|---|
-| LightGBM | 4.7.0 | MIT | Pair classifier (trained from scratch; tree ensemble, far below 8B parameters; exact tree count on full data: TODO) |
+| LightGBM | 4.7.0 | MIT | Pair classifier (trained from scratch; tree ensemble, far below 8B parameters; 5 fold models, 12,292 trees in total) |
 | scikit-learn | 1.9.1 | BSD-3-Clause | TF-IDF / hashing vectorisers |
 | rapidfuzz | 3.14.6 | MIT | String similarity features |
 | pandas | 3.0.6 | BSD-3-Clause | Tabular I/O |
