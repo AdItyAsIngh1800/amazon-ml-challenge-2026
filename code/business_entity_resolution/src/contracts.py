@@ -39,4 +39,7 @@ DECISION_CONFIG_KEYS: tuple[str, ...] = ("t", "t_empty", "one_owner", "score_col
 #   method ("threshold" | "per_source" | "expected_f05"), t_s2 / t_s3 (per_source;
 #   "t" then holds the global-threshold start point), one_owner_auto (bool),
 #   f05_by_one_owner ({"true": F, "false": F}). expected_f05 ignores t / t_empty.
-DECISION_CONFIG_OPTIONAL_KEYS: tuple[str, ...] = ("method", "t_s2", "t_s3", "one_owner_auto", "f05_by_one_owner")
+# decide v2: method "conditional_extra" adds t_conf / t_extra; one_owner_delta
+#   (float) makes one_owner soft (absent = hard one-owner rule).
+DECISION_CONFIG_OPTIONAL_KEYS: tuple[str, ...] = ("method", "t_s2", "t_s3", "one_owner_auto", "f05_by_one_owner",
+                                                  "t_conf", "t_extra", "one_owner_delta")

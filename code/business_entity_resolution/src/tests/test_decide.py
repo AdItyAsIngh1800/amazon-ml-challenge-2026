@@ -446,11 +446,17 @@ def test_compare_stage_table(train_paths: Paths) -> None:
     _main(train_paths, "compare", "train")
     t = pd.read_csv(train_paths.artifacts_dir / "decide_compare.tsv", sep="\t")
     assert t["variant"].tolist() == ["threshold+one_owner", "per_source+one_owner", "expected_f05+one_owner",
-                                     "threshold", "per_source", "expected_f05"]
+                                     "conditional_extra+one_owner", "threshold", "per_source", "expected_f05",
+                                     "conditional_extra", "threshold+soft_one_owner",
+                                     "conditional_extra+soft_one_owner"]
     assert {"overall", "singleton", "non_singleton", "country=US", "country=India"} <= set(t.columns)
     assert t.loc[0, "overall"] == pytest.approx(_brute_force_best(True), abs=1e-4)
-    assert t.loc[3, "overall"] == pytest.approx(_brute_force_best(False), abs=1e-4)
-    assert (t["overall"][[1, 4]].to_numpy() >= t["overall"][[0, 3]].to_numpy() - 1e-9).all()
+    assert t.loc[4, "overall"] == pytest.approx(_brute_force_best(False), abs=1e-4)
+    # per_source and conditional_extra start from the threshold optimum: never worse
+    assert (t["overall"][[1, 3, 5, 7]].to_numpy() >= t["overall"][[0, 0, 4, 4]].to_numpy() - 1e-9).all()
+    overall, params = t["overall"].tolist(), t["params"].astype(str).tolist()
+    assert overall[9] >= overall[8] - 1e-9
+    assert params[8].startswith("delta=") and "t_conf=" in params[9]
     assert not (train_paths.artifacts_dir / "decision_config.json").exists()
 
 
@@ -492,3 +498,148 @@ def test_compare_ignores_unblocked_s1(train_paths: Paths, caplog: pytest.LogCapt
     assert t.loc["per_source", "overall"] == pytest.approx(1.0)
     assert "country=India" not in t.columns
     assert any("using 1 of 3 train S1; 2 unblocked S1 excluded" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- decide v2
+
+
+def _pairs(rows: list[tuple[int, int, float, int]]) -> decide.Pairs:
+    """Pairs from (s1 code, cand code, score, label) tuples."""
+    s1, cand, score, label = zip(*rows, strict=True)
+    return decide.Pairs(np.array(s1, np.int32), np.array(cand, np.int32), np.array(score, np.float32),
+                        np.array(label, np.int8))
+
+
+def test_soft_one_owner_hand_built() -> None:
+    """Candidate 0 scored 0.75 / 0.5 / 0.25 by S1 0 / 1 / 2; candidate 1 tied 0.75 by S1 0 and 1."""
+    pairs = _pairs([(0, 0, 0.75, 1), (1, 0, 0.5, 0), (2, 0, 0.25, 0), (0, 1, 0.75, 1), (1, 1, 0.75, 0)])
+    assert decide.soft_one_owner_mask(pairs, 2, 0.0).tolist() == [True, False, False, True, True]  # ties stay
+    assert decide.soft_one_owner_mask(pairs, 2, 0.2).tolist() == [True, False, False, True, True]
+    assert decide.soft_one_owner_mask(pairs, 2, 0.25).tolist() == [True, True, False, True, True]
+    assert decide.soft_one_owner_mask(pairs, 2, 1.0).all()
+    assert decide.one_owner_mask(pairs, 2).tolist() == [True, False, False, True, False]  # hard: lowest S1 wins tie
+    with pytest.raises(ValueError, match=">= 0"):
+        decide.soft_one_owner_mask(pairs, 2, -0.1)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("delta", [0.0, 0.05, 0.1, 0.3])
+def test_soft_one_owner_matches_brute_force(seed: int, delta: float) -> None:
+    """A pair is dropped iff some other S1 scores the same candidate more than delta higher."""
+    pairs, _, _ = _random_pairs(seed)
+    got = decide.soft_one_owner_mask(pairs, 60, delta)
+    for i in range(len(pairs.s1)):
+        others = pairs.score[(pairs.cand == pairs.cand[i]) & (pairs.s1 != pairs.s1[i])]
+        assert got[i] == (not (others - pairs.score[i] > np.float32(delta)).any())
+
+
+def test_extra_grid() -> None:
+    """t_extra runs 0.30, 0.32, ... strictly below t."""
+    g = decide.extra_grid(0.69)
+    assert len(g) == 20 and g[0] == pytest.approx(0.30) and g[-1] == pytest.approx(0.68)
+    assert decide.extra_grid(0.70)[-1] == pytest.approx(0.68)
+    assert decide.extra_grid(0.30) == () and decide.extra_grid(0.1) == ()
+
+
+def test_conditional_extra_hand_built() -> None:
+    """S1 0 is confident (0.99) so its 0.5 true match is accepted; S1 1's 0.5 distractor is not.
+
+    One global threshold cannot separate the two 0.5 pairs; conditional_extra reaches F0.5 = 1.
+    """
+    pairs = _pairs([(0, 0, 0.99, 1), (0, 1, 0.5, 1), (0, 2, 0.2, 0), (1, 3, 0.8, 1), (1, 4, 0.5, 0)])
+    n_truth = np.array([2, 1], np.int64)
+    keep = np.ones(5, dtype=bool)
+    grid = decide.threshold_grid(pairs.score, 200)
+    t, te, f = decide.grid_search(pairs, keep, n_truth, grid)
+    assert f < 1.0
+    rule = decide.conditional_search(pairs, keep, n_truth, grid, (t, te, f))
+    assert rule["f05"] == pytest.approx(1.0) and rule["t_extra"] <= 0.5 < rule["t"] and rule["t_conf"] <= 0.99
+    ids = decide.SplitIds(pd.Index(["S1-1", "S1-2"]), pd.Index([f"S2-{i}" for i in range(5)]),
+                          np.array(["US", "US"], dtype=object), np.empty(0, np.int64), np.empty(0, np.int64),
+                          np.array([2 * 10**12 + i for i in range(5)]), np.arange(5))
+    sel = decide.apply_rule(pairs, ids, keep, {**rule, "method": "conditional_extra"})
+    assert sel.tolist() == [True, True, False, True, False]
+
+
+def test_conditional_extra_noop_when_nothing_helps() -> None:
+    """No S1 reaches t_conf: the threshold optimum is returned with t_extra = t (no extra accepted)."""
+    pairs = _pairs([(0, 0, 0.8, 1), (0, 1, 0.5, 0), (1, 2, 0.6, 1)])
+    n_truth = np.array([1, 1], np.int64)
+    keep = np.ones(3, dtype=bool)
+    grid = decide.threshold_grid(pairs.score, 200)
+    start = decide.grid_search(pairs, keep, n_truth, grid)
+    rule = decide.conditional_search(pairs, keep, n_truth, grid, start)
+    assert (rule["t"], rule["t_empty"], rule["f05"]) == start and rule["t_extra"] == rule["t"]
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_conditional_extra_brute_force(seed: int) -> None:
+    """Step 1 = exhaustive (t_conf, t_extra, t_empty) search at the start t; the final rule is
+    between the threshold optimum and the exhaustive optimum, and its F0.5 is what apply_rule scores."""
+    pairs, n_truth, _ = _random_pairs(seed)
+    n = len(n_truth)
+    keep = decide.one_owner_mask(pairs, 60) if seed % 2 else np.ones(len(pairs.s1), dtype=bool)
+    grid = decide.threshold_grid(pairs.score, 200, step=0)
+    mx = decide.max_score_per_s1(pairs, keep, n)
+    start = decide.grid_search(pairs, keep, n_truth, grid)
+
+    def f_of(t: float, tc: float, tx: float, te: float) -> float:
+        sel = decide.select(pairs, keep, mx, decide.conditional_thresholds(pairs, mx, t, tc, tx), te)
+        return float(decide.per_s1_scores(pairs, sel, n_truth).mean())
+
+    def best_at(t: float) -> float:
+        return max(f_of(t, tc, tx, te) for tc in config.DECIDE_EXTRA_T_CONF
+                   for tx in (*decide.extra_grid(t), t) for te in (0.0, *grid))
+
+    step1 = decide._extra_search(pairs, keep, mx, decide._Gate(mx, n_truth, grid), start[0], start[2])
+    assert (step1[3] if step1 else start[2]) == pytest.approx(best_at(start[0]), abs=1e-12)
+    overall = max(best_at(t) for t in grid)
+    rule = decide.conditional_search(pairs, keep, n_truth, grid, start)
+    assert start[2] - 1e-12 <= rule["f05"] <= overall + 1e-12
+    got = f_of(rule["t"], rule["t_conf"], rule["t_extra"], rule["t_empty"])
+    assert got == pytest.approx(rule["f05"], abs=1e-12)
+    sel = decide.select(pairs, keep, mx, decide.conditional_thresholds(pairs, mx, rule["t"], rule["t_conf"],
+                                                                      rule["t_extra"]), rule["t_empty"])
+    assert _macro(pairs, sel, n_truth) == pytest.approx(rule["f05"], abs=1e-12)
+
+
+def test_conditional_extra_decide_and_write(train_paths: Paths) -> None:
+    """--decide-method conditional_extra --decide-one-owner-delta: keys recorded; write applies them unchanged."""
+    paths = train_paths
+    _make_split(paths, "test", TEST)
+    io_utils.save_parquet(pd.DataFrame(PRED, columns=["s1_id", "cand_id", "prob"]),
+                          paths.artifacts_dir / "pred_test.parquet")
+    try:
+        _main(paths, "decide", "train", "--decide-method", "conditional_extra", "--decide-one-owner-delta", "0.1")
+    finally:
+        config.DECIDE_METHOD, config.DECIDE_ONE_OWNER_DELTA = "threshold", None
+    cfg_file = paths.artifacts_dir / "decision_config.json"
+    cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert cfg["method"] == "conditional_extra" and cfg["one_owner_delta"] == 0.1
+    assert {"t_conf", "t_extra"} <= set(cfg) and cfg["train_f05"] >= _brute_force_best(True) - 1e-6
+    # S1-10's best is 0.95 >= t_conf, so its 0.7 candidate passes t_extra; S1-12 (max 0.4) stays empty
+    cfg.update(t=0.9, t_empty=0.9, t_conf=0.95, t_extra=0.5, one_owner=True)
+    cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+    _main(paths, "write", "test")
+    m = (paths.output_dir / "matching_results.tsv").read_text(encoding="utf-8").splitlines()[1:]
+    assert m == ["S1-10\tS2-1,S3-1", "S1-11\t", "S1-12\t"]
+
+
+def test_write_soft_one_owner(test_paths: Paths) -> None:
+    """one_owner_delta 0.15: S2-2 (0.2 on S1-10, 0.1 on S1-12) stays on both S1; the hard rule keeps S1-10 only."""
+    cfg_file = test_paths.artifacts_dir / "decision_config.json"
+    base = json.loads(cfg_file.read_text(encoding="utf-8")) | {"t": 0.05, "t_empty": 0.0}
+    for delta, s1_12 in ((None, "S1-12\tS3-2"), (0.15, "S1-12\tS3-2,S2-2")):
+        cfg = base | ({} if delta is None else {"one_owner_delta": delta})
+        cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+        decide.run_stage(test_paths, "test")
+        m = (test_paths.output_dir / "matching_results.tsv").read_text(encoding="utf-8").splitlines()[1:]
+        assert m == ["S1-10\tS2-1,S3-1,S2-2", "S1-11\t", s1_12]
+
+
+def test_conditional_extra_needs_probabilities(train_paths: Paths, monkeypatch: pytest.MonkeyPatch) -> None:
+    """conditional_extra on a rule-baseline score is refused before any work."""
+    monkeypatch.setattr(config, "DECIDE_METHOD", "conditional_extra")
+    monkeypatch.setattr(config, "DECIDE_SCORE_COLUMN", "score")
+    with pytest.raises(ValueError, match="needs probabilities"):
+        decide.run_decide(train_paths)

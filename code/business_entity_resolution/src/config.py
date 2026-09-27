@@ -87,7 +87,18 @@ DECIDE_GRID_STEP: float = 0.005
 #   "threshold"    one t for all candidates (+ t_empty gate)
 #   "per_source"   t_s2 / t_s3 by candidate ID prefix, coordinate descent from the global t
 #   "expected_f05" per S1, the probability-sorted prefix with the highest expected F0.5
+#   "conditional_extra" threshold rule, plus: an S1 whose best kept candidate has
+#                  p >= t_conf also accepts its other kept candidates with p >= t_extra
 DECIDE_METHOD: str = "threshold"
+# conditional_extra grids: t_conf values, and t_extra = MIN, MIN + STEP, ... (< t).
+DECIDE_EXTRA_T_CONF: tuple[float, ...] = (0.90, 0.95, 0.98, 0.99)
+DECIDE_EXTRA_MIN: float = 0.30
+DECIDE_EXTRA_STEP: float = 0.02
+# Soft one-owner (run_pipeline --decide-one-owner-delta): with one_owner on, a
+# candidate is dropped from an S1 only if another S1 scores it more than delta
+# higher. None = the hard rule (highest S1 only). compare tunes delta over the grid.
+DECIDE_ONE_OWNER_DELTA: float | None = None
+DECIDE_DELTA_GRID: tuple[float, ...] = (0.0, 0.02, 0.05, 0.1, 0.2, 0.3)
 DECIDE_CD_ROUNDS: int = 5  # max coordinate-descent rounds for "per_source"
 # True: tune with and without the one-owner rule, keep the better (--decide-one-owner-auto).
 DECIDE_ONE_OWNER_AUTO: bool = False

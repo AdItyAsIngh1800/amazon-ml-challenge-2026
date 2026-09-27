@@ -196,6 +196,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"decision rule tuned by decide (default {config.DECIDE_METHOD})")
     p.add_argument("--decide-one-owner-auto", action="store_true",
                    help="decide: keep whichever one-owner setting scores higher")
+    p.add_argument("--decide-one-owner-delta", type=float, default=None,
+                   help="decide: soft one-owner, drop a candidate from an S1 only if another S1 scores it more "
+                        "than this higher (default: hard one-owner rule)")
     for flag, name in CONFIG_OVERRIDES.items():
         p.add_argument(f"--{flag.replace('_', '-')}", type=int, default=None,
                        help=f"override config.{name} (default {getattr(config, name)})")
@@ -232,7 +235,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         config.DECIDE_METHOD = args.decide_method
     if args.decide_one_owner_auto:
         config.DECIDE_ONE_OWNER_AUTO = True
-    logger.info("config.DECIDE_METHOD = %s, DECIDE_ONE_OWNER_AUTO = %s", config.DECIDE_METHOD, config.DECIDE_ONE_OWNER_AUTO)
+    if args.decide_one_owner_delta is not None:
+        config.DECIDE_ONE_OWNER_DELTA = args.decide_one_owner_delta
+    logger.info("config.DECIDE_METHOD = %s, DECIDE_ONE_OWNER_AUTO = %s, DECIDE_ONE_OWNER_DELTA = %s",
+                config.DECIDE_METHOD, config.DECIDE_ONE_OWNER_AUTO, config.DECIDE_ONE_OWNER_DELTA)
     if args.decision_config is not None:
         config.DECISION_CONFIG_PATH = args.decision_config.resolve()
         logger.info("config.DECISION_CONFIG_PATH = %s", config.DECISION_CONFIG_PATH)
