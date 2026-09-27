@@ -102,6 +102,7 @@ CONFIG_OVERRIDES: dict[str, str] = {
     "max_candidates_per_s1": "MAX_CANDIDATES_PER_S1",
     "feature_chunk_pairs": "FEATURE_CHUNK_PAIRS",
     "lgbm_num_threads": "LGBM_NUM_THREADS",
+    "predict_threads": "PREDICT_THREADS",
     "rapidfuzz_workers": "RAPIDFUZZ_WORKERS",
     "train_max_rows": "TRAIN_MAX_ROWS",
 }
@@ -205,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--block-s1-fraction", type=float, default=None,
                    help="train only: block a stratified (country x singleton) fraction of S1; the rest get no "
                         f"candidates and are excluded from training and decide (default {config.BLOCK_S1_FRACTION})")
+    p.add_argument("--feature-set", choices=("v1", "v2"), default=None,
+                   help=f"feat: v2 adds unit/number, exact-address, suffix-robust name and same-address "
+                        f"features to v1 (default {config.FEATURE_SET})")
+    p.add_argument("--predict-models", choices=("all", "fold0"), default=None,
+                   help=f"predict: mean of all fold models or fold 0 only (default {config.PREDICT_MODELS})")
     return p
 
 
@@ -228,6 +234,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.block_s1_fraction is not None:
         config.BLOCK_S1_FRACTION = args.block_s1_fraction
     logger.info("config.BLOCK_S1_FRACTION = %s", config.BLOCK_S1_FRACTION)
+    if args.feature_set is not None:
+        config.FEATURE_SET = args.feature_set
+    if args.predict_models is not None:
+        config.PREDICT_MODELS = args.predict_models
+    logger.info("config.FEATURE_SET = %s, PREDICT_MODELS = %s", config.FEATURE_SET, config.PREDICT_MODELS)
     if args.decide_score_column is not None:
         config.DECIDE_SCORE_COLUMN = args.decide_score_column
     logger.info("config.DECIDE_SCORE_COLUMN = %s", config.DECIDE_SCORE_COLUMN)
