@@ -18,7 +18,7 @@ external APIs, geocoders or registries, no hosted models. The only model is Ligh
 | train | `model.py` | LightGBM, 5-fold GroupKFold by S1, out-of-fold probabilities for every train pair | `oof_train.parquet`, `models/` |
 | predict | `model.py` | Mean probability of the 5 fold models on the test pairs | `pred_test.parquet` |
 | compare | `decide.py` | Optional: tunes every decision variant on the same train OOF and tabulates F0.5 (overall / singleton / non-singleton / per country) | `decide_compare.tsv` |
-| decide | `decide.py` | Tunes the decision rule for macro F0.5 on the train OOF: one threshold `t`, per-source `t_s2`/`t_s3`, or per-S1 expected-F0.5 selection (`--decide-method`); empty-list gate `t_empty`; one-owner rule on, off or auto | `decision_config.json` |
+| decide | `decide.py` | Tunes the decision rule for macro F0.5 on the train OOF: one threshold `t`, per-source `t_s2`/`t_s3`, per-S1 expected-F0.5 selection, or `conditional_extra` (lower `t_extra` for S1 whose best candidate is >= `t_conf`) (`--decide-method`); empty-list gate `t_empty`; one-owner rule on, off, auto or soft (`--decide-one-owner-delta`) | `decision_config.json` |
 | write | `decide.py` | Applies `decision_config.json` unchanged to test and writes both TSVs, then runs the validator | `--out-dir`/`*.tsv` |
 
 There is no country-specific code: blocking compares records that carry the same country
@@ -68,8 +68,8 @@ trains the models and tunes the decision rule), then the test split.
 ```bash
 cd code/business_entity_resolution
 D="--data-dir ../../dataset --out-dir ../../output --artifacts-dir ../../artifacts"
-# Decision rule: threshold (default) | per_source | expected_f05, optionally with
-# --decide-one-owner-auto. Pick it from the compare table below, e.g.
+# Decision rule: threshold (default) | per_source | expected_f05 | conditional_extra,
+# optionally with --decide-one-owner-auto or --decide-one-owner-delta D (soft one-owner). Pick it from the compare table below, e.g.
 # DECIDE="--decide-method expected_f05 --decide-one-owner-auto"
 DECIDE="--decide-method threshold"
 
