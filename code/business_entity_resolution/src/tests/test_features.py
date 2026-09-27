@@ -14,6 +14,22 @@ from src import blocking, config, features, normalize
 from src.config import Paths
 from src.tests.test_blocking import _write_synthetic
 
+# Column order of features_{split} parts with FEATURE_SET v1 (the submitted M2 pipeline).
+V1_COLUMNS: list[str] = [
+    's1_id', 'cand_id', 'name_core_ratio', 'name_core_token_set', 'name_core_token_sort', 'name_core_partial',
+    'name_core_jw', 'name_core_lev', 'name_norm_ratio', 'name_norm_token_set', 'name_norm_token_sort', 'name_norm_partial',
+    'name_norm_jw', 'name_norm_lev', 'name_key_ratio', 'name_translit_ratio', 'name_translit_token_set', 'name_char3_cos',
+    'name_tok_idf_jacc', 'name_tok_jacc', 'acr_s1_is_cand', 'acr_cand_is_s1', 'sfx_equal', 'sfx_conflict',
+    'sfx_missing', 'name_len_ratio', 'first_tok_match', 'name_digit_jacc', 'name_digit_one_side', 'postal_match',
+    'postal_conflict', 'postal_missing', 'num_overlap', 'num_conflict', 'addr_tok_cos', 'addr_tok_idf_jacc',
+    'addr_tok_jacc', 'addr_norm_token_set', 'addr_translit_token_set', 's1_landmark_flag', 'cand_landmark_flag', 's1_name_empty',
+    'cand_name_empty', 's1_addr_empty', 'cand_addr_empty', 'grp_n_cands', 'grp_name_char3_cos_rank', 'grp_name_char3_cos_gap',
+    'grp_name_char3_cos_z', 'grp_name_core_token_set_rank', 'grp_name_core_token_set_gap', 'grp_name_core_token_set_z', 'grp_addr_tok_cos_rank', 'grp_addr_tok_cos_gap',
+    'grp_addr_tok_cos_z', 'country_match', 'pass_A_score', 'pass_A_rank', 'pass_B_score', 'pass_B_rank',
+    'pass_C_score', 'pass_C_rank', 'pass_F_score', 'pass_F_rank', 'n_passes', 'best_block_score',
+    'rrf_score', 'rev_n_s1', 'rev_rank', 'rev_gap', 'cand_is_s3', 'label',
+]
+
 
 def _records(rows: list[tuple[str, str, str]]) -> pa.Table:
     """records columns for (entity_id, name, address) rows via normalize.build_records."""
@@ -129,3 +145,99 @@ def test_run_stage_missing_column_raises(tmp_path: Path) -> None:
     pq.write_table(rec, paths.artifacts_dir / "records_test.parquet")
     with pytest.raises(ValueError, match="name_key"):
         features.run_stage(paths, "test")
+
+
+def _v2(rows: list[tuple[str, str, str]], s1: list[int] | None = None) -> dict[str, np.ndarray]:
+    """v2_features of pairs (row 0, row i) for i >= 1; S1 code 0 for every pair unless given."""
+    rec = _records(rows)
+    n = len(rows) - 1
+    left, right = np.zeros(n, np.intp), np.arange(1, n + 1, dtype=np.intp)
+    idf = features.fit_idf(rec.column("name_norm"), "char_wb", 3)
+    base = {"name_char3_cos": features.cosine(idf, rec.column("name_norm").to_pylist(), left, right)}
+    codes = np.array(s1 if s1 is not None else [0] * n, np.int32)
+    out = features.v2_features(rec, left, right, codes, base)
+    assert all(v.dtype == np.float32 and len(v) == n for v in out.values())
+    return out
+
+
+def test_v2_unit_and_number_features() -> None:
+    """A402 vs A407 in one building is a unit conflict; same unit equal; unit on one side only."""
+    f = _v2([
+        ("S1-1", "Acme", "Flat A-402, Tower 3, MG Road 411001"),
+        ("S2-1", "Acme", "A407 Tower 3 MG Road 411001"),
+        ("S2-2", "Acme", "A402 Tower 3 MG Road 411001"),
+        ("S2-3", "Acme", "Tower 3 MG Road 411001"),
+        ("S2-4", "Acme", "Tower 9 MG Road 560001"),
+    ])
+    assert f["unit_equal"].tolist() == [0, 1, 0, 0]
+    assert f["unit_conflict"].tolist() == [1, 0, 0, 0]
+    assert f["unit_missing_one"].tolist() == [0, 0, 1, 1]
+    # S1 numbers {3, 411001} (402 belongs to unit a402); S2-4 {9, 560001}.
+    assert f["num_one_side_n"].tolist() == [0, 0, 0, 4]
+    assert features._addr_parts("flat a 402 tower 3 rd 411001") == (frozenset({"a402"}), frozenset({"3", "411001"}), "3")
+    assert f["num_disjoint"].tolist() == [0, 0, 0, 1]
+
+
+def test_v2_exact_address_features() -> None:
+    """Exact addr_norm, same token set in another order, house number + postal equal."""
+    f = _v2([
+        ("S1-1", "Acme", "12 Main St 411001"),
+        ("S2-1", "Zeta", "12 Main St 411001"),
+        ("S2-2", "Zeta", "Main St 12 411001"),
+        ("S2-3", "Zeta", "12 Oak Avenue 411001"),
+        ("S2-4", "Zeta", "14 Main St 411001"),
+        ("S2-5", "Zeta", ""),
+    ])
+    assert f["addr_exact"].tolist() == [1, 0, 0, 0, 0]
+    assert f["addr_tokset_equal"].tolist() == [1, 1, 0, 0, 0]
+    assert f["house_postal_equal"].tolist() == [1, 1, 1, 0, 0]
+
+
+def test_v2_name_features() -> None:
+    """Legal suffix and word order do not matter; containment; suffix-free token_set."""
+    f = _v2([
+        ("S1-1", "Acme Industries Pvt. Ltd.", "x"),
+        ("S2-1", "Industries Acme Inc", "x"),
+        ("S2-2", "Acme Industries Pune", "x"),
+        ("S2-3", "Zeta Labs", "x"),
+    ])
+    assert f["name_core_tokset_equal"].tolist() == [1, 0, 0]
+    assert f["name_core_contained"].tolist() == [1, 1, 0]
+    assert f["name_nosfx_token_set"][0] == 1.0 and f["name_nosfx_token_set"][2] < 0.5
+    assert features._name_no_suffix("Acme Industries Pvt. Ltd.", "acme industries pvt ltd",
+                                    "acme industries") == "acme industries"
+
+
+def test_v2_same_address_context() -> None:
+    """Count of this S1's candidates at the same addr_norm and name rank among them; other S1 separate."""
+    f = _v2([
+        ("S1-1", "Acme Stores", "1 Main St"),
+        ("S2-1", "Acme Stores", "5 Oak Rd"),
+        ("S2-2", "Zeta", "5 Oak Rd"),
+        ("S2-3", "Acme Store", "9 Elm St"),
+        ("S2-4", "Acme Stores", "5 Oak Rd"),
+        ("S2-5", "Acme", ""),
+    ], s1=[0, 0, 0, 1, 0])
+    assert f["grp_same_addr_n"].tolist() == [2, 2, 1, 1, 0]
+    assert f["grp_same_addr_name_rank"][:4].tolist() == [1, 2, 1, 1]
+    assert np.isnan(f["grp_same_addr_name_rank"][4])
+
+
+def test_feature_set_v1_unchanged_v2_superset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """v1 keeps the exact v1 column list; v2 = the same v1 columns with identical values + the v2 columns."""
+    monkeypatch.setattr(config, "SHARED_ARTIFACTS_DIR", tmp_path / "shared")
+    paths = _write_synthetic(tmp_path)
+    blocking.run_stage(paths, "train")
+    features.run_stage(paths, "train")
+    v1 = pd.read_parquet(paths.artifacts_dir / "features_train")
+    assert list(v1.columns) == V1_COLUMNS
+    monkeypatch.setattr(config, "FEATURE_SET", "v2")
+    features.run_stage(paths, "train")
+    v2 = pd.read_parquet(paths.artifacts_dir / "features_train")
+    extra = [c for c in v2.columns if c not in V1_COLUMNS]
+    assert len(extra) == 13 and not any("country" in c for c in extra)
+    pd.testing.assert_frame_equal(v2[V1_COLUMNS], v1)
+    assert (v2[extra].dtypes == np.float32).all()
+    monkeypatch.setattr(config, "FEATURE_SET", "v3")
+    with pytest.raises(ValueError, match="FEATURE_SET"):
+        features.run_stage(paths, "train")

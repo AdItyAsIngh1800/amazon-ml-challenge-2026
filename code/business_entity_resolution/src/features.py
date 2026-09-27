@@ -3,7 +3,8 @@
 Reads:  <artifacts>/records_{split}.parquet, candidates_{split}.parquet
         (+ <data>/train/train_ground_truth.tsv for the train label)
 Writes: <artifacts>/features_{split}/part-*.parquet: s1_id, cand_id (string),
-        float32 feature columns (names fixed by the code, same for every part), + int8 ``label`` on train.
+        float32 feature columns (names fixed by the code and config.FEATURE_SET, same for every
+        part), + int8 ``label`` on train. v2 = every v1 column (same values) plus ``v2_features``.
         One row per candidate pair, in candidates file order.
 
 No country identity features: only ``country_match`` (agreement flag).
@@ -301,6 +302,107 @@ def group_features(s1: NDArray[np.int32], feats: dict[str, F32]) -> dict[str, F3
     return out
 
 
+# --------------------------------------------------------------------------- v2 features (config.FEATURE_SET)
+
+FEATURE_SETS: tuple[str, ...] = ("v1", "v2")
+
+
+def _addr_parts(addr: str) -> tuple[frozenset[str], frozenset[str], str]:
+    """Unit tokens, pure numbers and house number of one ``addr_norm``.
+
+    A unit is a token mixing letters and digits (``a407``) or a single letter
+    followed by a short number, which normalisation splits (``a-402`` ->
+    ``a 402`` -> ``a402``). The house number is the first pure number under 5
+    digits (5-6 digit numbers are postal-like).
+
+    Returns:
+        ``(units, numbers, house)``; ``house`` is "" when there is none.
+    """
+    toks = addr.split()
+    units: set[str] = set()
+    nums: set[str] = set()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if len(t) == 1 and t.isalpha() and i + 1 < len(toks) and toks[i + 1].isdigit() and len(toks[i + 1]) < 5:
+            units.add(t + toks[i + 1])  # the number is part of the unit, not a bare number
+            i += 1
+        elif t.isdigit():
+            nums.add(t)
+        elif t.isalnum() and any(c.isdigit() for c in t):
+            units.add(t)
+        i += 1
+    house = min((t for t in nums if len(t) < 5), key=toks.index, default="")
+    return frozenset(units), frozenset(nums), house
+
+
+def _name_no_suffix(translit: str, norm: str, core: str) -> str:
+    """``name_translit`` (rapidfuzz default_process) minus the legal-suffix tokens.
+
+    Suffix tokens = tokens of ``name_norm`` not in ``name_core`` (e.g. ``pvt ltd``);
+    a non-Latin translit shares none, so it is kept whole.
+    """
+    sfx = set(norm.split()) - set(core.split())
+    return " ".join(t for t in utils.default_process(translit).split() if t not in sfx)
+
+
+def v2_features(rec: pa.Table, left: NDArray[np.intp], right: NDArray[np.intp], s1: NDArray[np.int32],
+                feats: dict[str, F32]) -> dict[str, F32]:
+    """Extra v2 features: unit/number conflicts, exact-address, suffix-robust names, same-address context.
+
+    Args:
+        rec: Unique records of the chunk, columns ``RECORD_COLUMNS``.
+        left: Row in ``rec`` of each pair's S1 record.
+        right: Row in ``rec`` of each pair's candidate record.
+        s1: S1 code per pair; every S1's pairs are complete within this chunk.
+        feats: v1 features of the chunk; must contain ``name_char3_cos``.
+
+    Returns:
+        Feature name -> float32 array, one value per pair (NaN = undefined).
+        Python loops, a few µs per pair; memory linear in the chunk.
+    """
+    addr = rec.column("addr_norm").to_pylist()
+    parts = [_addr_parts(a) for a in addr]
+    postal = [frozenset(p) for p in rec.column("postal_tokens").to_pylist()]
+    core_toks = [frozenset(c.split()) for c in rec.column("name_core").to_pylist()]
+    addr_toks = [frozenset(a.split()) for a in addr]
+    nosfx = [_name_no_suffix(t, n, c) for t, n, c in zip(rec.column("name_translit").to_pylist(),
+                                                         rec.column("name_norm").to_pylist(),
+                                                         rec.column("name_core").to_pylist(), strict=True)]
+    names = ("unit_equal", "unit_conflict", "unit_missing_one", "num_one_side_n", "num_disjoint",
+             "addr_exact", "addr_tokset_equal", "house_postal_equal", "name_core_tokset_equal",
+             "name_core_contained")
+    v = np.zeros((len(names), len(left)), dtype=np.float32)
+    for i, (a, b) in enumerate(zip(left, right, strict=True)):  # ponytail: Python loop, ~3 µs/pair
+        (ua, na, ha), (ub, nb, hb) = parts[a], parts[b]
+        ca, cb = core_toks[a], core_toks[b]
+        v[0, i] = bool(ua & ub)
+        v[1, i] = bool(ua) and bool(ub) and not ua & ub
+        v[2, i] = bool(ua) != bool(ub)
+        v[3, i] = len(na ^ nb)
+        v[4, i] = bool(na) and bool(nb) and not na & nb
+        v[5, i] = bool(addr[a]) and addr[a] == addr[b]
+        v[6, i] = bool(addr_toks[a]) and addr_toks[a] == addr_toks[b]
+        v[7, i] = bool(ha) and ha == hb and bool(postal[a] & postal[b])
+        v[8, i] = bool(ca) and ca == cb
+        v[9, i] = bool(ca) and bool(cb) and (ca <= cb or cb <= ca)
+    out = {n: v[k] for k, n in enumerate(names)}
+    out["name_nosfx_token_set"] = fuzz_scores([nosfx[i] for i in left], [nosfx[i] for i in right],
+                                              fuzz.token_set_ratio, 100.0)
+
+    # Same-address context: this S1's candidates sharing this candidate's addr_norm.
+    cand_addr = pd.Series([addr[i] for i in right])
+    has = (cand_addr != "").to_numpy()
+    df = pd.DataFrame({"s1": s1, "addr": cand_addr, "sim": np.nan_to_num(feats["name_char3_cos"], nan=0.0)})[has]
+    grp = df.groupby(["s1", "addr"], sort=False)["sim"]
+    n_same = np.zeros(len(left), dtype=np.float32)
+    rank = np.full(len(left), np.nan, dtype=np.float32)
+    n_same[has] = grp.transform("size").to_numpy()
+    rank[has] = grp.rank(ascending=False, method="min").to_numpy()
+    out["grp_same_addr_n"], out["grp_same_addr_name_rank"] = n_same, rank
+    return out
+
+
 # --------------------------------------------------------------------------- chunking
 
 
@@ -353,8 +455,12 @@ def run_stage(paths: Paths, split: str) -> None:
 
     Raises:
         ValueError: If an input column is missing, an ID is unknown, or a
-            S1's candidates are not contiguous in candidates_{split}.parquet.
+            S1's candidates are not contiguous in candidates_{split}.parquet,
+            or config.FEATURE_SET is not in FEATURE_SETS.
     """
+    if config.FEATURE_SET not in FEATURE_SETS:
+        raise ValueError(f"config.FEATURE_SET={config.FEATURE_SET!r}; expected one of {FEATURE_SETS}")
+    logger.info("Feature set %s", config.FEATURE_SET)
     art = paths.artifacts_dir
     rec_path, cand_path = art / f"records_{split}.parquet", art / f"candidates_{split}.parquet"
     io_utils.require_columns(pq.ParquetFile(rec_path).schema_arrow.names, RECORD_COLUMNS, str(rec_path))
@@ -390,8 +496,11 @@ def run_stage(paths: Paths, split: str) -> None:
 
         uniq, inv = np.unique(np.concatenate([s1, cand]), return_inverse=True)
         left, right = inv[: len(s1)].astype(np.intp), inv[len(s1):].astype(np.intp)
-        feats = pair_features(rec.take(pa.array(uniq)), left, right, name_char, name_word, addr_word)
+        sub = rec.take(pa.array(uniq))
+        feats = pair_features(sub, left, right, name_char, name_word, addr_word)
         feats |= group_features(s1, feats)
+        if config.FEATURE_SET == "v2":
+            feats |= v2_features(sub, left, right, s1, feats)
         for c in BLOCK_FEATURES:
             feats[c] = chunk.column(c).to_numpy(zero_copy_only=False).astype(np.float32)
         feats["cand_is_s3"] = _f(pc.equal(chunk.column("cand_source"), "S3").to_numpy(zero_copy_only=False))

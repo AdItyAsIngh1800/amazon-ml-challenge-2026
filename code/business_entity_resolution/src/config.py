@@ -68,10 +68,14 @@ PASS_C_MIN_NAME_COSINE: float = 0.2
 # Features (owner: features.py): candidate pairs per parquet part.
 FEATURE_CHUNK_PAIRS: int = 300_000
 RAPIDFUZZ_WORKERS: int = -1  # all cores, for rapidfuzz.process.cdist
+FEATURE_SET: str = "v1"  # "v2" adds features.v2_features to every v1 column
 
 N_FOLDS: int = 5
 # Model (owner: model.py): training pairs per fold (whole S1 groups sampled).
 TRAIN_MAX_ROWS: int = 10_000_000
+# predict: "all" = mean of the N_FOLDS fold models, "fold0" = fold 0's model only (~N_FOLDS x faster).
+PREDICT_MODELS: str = "all"
+PREDICT_THREADS: int | None = None  # None = LGBM_NUM_THREADS
 
 # Decision layer (owner: decide.py). "prob" reads model OOF / test predictions;
 # "score" reads a rule-baseline score column from the same files until the

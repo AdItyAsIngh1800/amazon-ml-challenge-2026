@@ -1,7 +1,8 @@
 """Stages `train` (split=train) and `predict` (split=test): LightGBM.
 
 train:   features_train/ -> <artifacts>/oof_train.parquet (contracts.OOF_COLUMNS),
-         models/model_fold{k}.txt, feature_importance.tsv (mean gain).
+         models/model_fold{k}.txt, models/feature_list.json (exact feature columns,
+         in order), feature_importance.tsv (mean gain).
          GroupKFold(config.N_FOLDS) by S1 over ALL train S1. Each fold trains
          on whole S1 groups sampled from the other folds, capped at
          config.TRAIN_MAX_ROWS pairs, early-stopping on VALID_FRACTION of those
@@ -9,7 +10,9 @@ train:   features_train/ -> <artifacts>/oof_train.parquet (contracts.OOF_COLUMNS
          covers all train pairs. Deterministic, seed config.SEED,
          config.LGBM_NUM_THREADS threads.
 predict: features_test/ -> <artifacts>/pred_test.parquet (contracts.PRED_COLUMNS),
-         mean probability of the fold models.
+         mean probability of the fold models (config.PREDICT_MODELS="all") or
+         fold 0's model only ("fold0"), config.PREDICT_THREADS threads. Refuses
+         to run unless the test feature columns equal models/feature_list.json.
 
 Memory: one pass reads only s1_id/label (int32 S1 code + int8 label per pair,
 5 bytes/pair, ~0.55 GB for 110M pairs). The sampled training rows are loaded
@@ -22,6 +25,7 @@ stage guarantees it) to number S1 groups without loading records.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterator
@@ -46,6 +50,7 @@ OWNER = "model.py (lane feat)"
 
 MODEL_DIR = "models"
 IMPORTANCE_FILE = "feature_importance.tsv"
+FEATURE_LIST_FILE = "feature_list.json"
 NON_FEATURES: tuple[str, ...] = (*contracts.FEATURES_KEY_COLUMNS, "label")
 VALID_FRACTION = 0.1  # share of sampled training S1 groups held out for early stopping
 NUM_BOOST_ROUND = 3000
@@ -201,6 +206,7 @@ def run_train(paths: Paths) -> None:
     logger.info("Binned %d sampled pairs (%d S1) in %.1fs", len(row_s1), int(sampled.sum()), time.perf_counter() - t0)
 
     (art / MODEL_DIR).mkdir(parents=True, exist_ok=True)
+    (art / MODEL_DIR / FEATURE_LIST_FILE).write_text(json.dumps(cols, indent=1) + "\n", encoding="utf-8")
     params = LGBM_PARAMS | {"num_threads": config.LGBM_NUM_THREADS}
     boosters: list[lgb.Booster] = []
     for k in range(config.N_FOLDS):
@@ -256,25 +262,53 @@ def run_train(paths: Paths) -> None:
     )
 
 
+def trained_features(model_dir: Path, booster: lgb.Booster) -> list[str]:
+    """Feature list saved by train (``feature_list.json``); the booster's own names for older models.
+
+    Raises:
+        ValueError: If the saved list disagrees with the booster's feature names.
+    """
+    names: list[str] = booster.feature_name()
+    path = model_dir / FEATURE_LIST_FILE
+    if not path.exists():
+        logger.warning("%s missing (model trained before it existed); using the model's feature names", path)
+        return names
+    saved: list[str] = json.loads(path.read_text(encoding="utf-8"))
+    if saved != names:
+        raise ValueError(f"{path} does not match the model's feature names")
+    return saved
+
+
 def run_predict(paths: Paths) -> None:
-    """Mean fold-model probability for every test pair -> pred_test.parquet.
+    """Fold-model probability for every test pair -> pred_test.parquet.
+
+    Mean of all fold models, or fold 0 only when config.PREDICT_MODELS == "fold0".
 
     Raises:
         FileNotFoundError: If a fold model is missing.
-        ValueError: If features_test lacks a feature the models were trained on.
+        ValueError: If config.PREDICT_MODELS is unknown, or the features_test
+            columns differ from the trained feature list (names the difference).
     """
     art = paths.artifacts_dir
-    boosters = [lgb.Booster(model_file=art / MODEL_DIR / f"model_fold{k}.txt") for k in range(config.N_FOLDS)]
-    cols: list[str] = boosters[0].feature_name()
+    if config.PREDICT_MODELS not in ("all", "fold0"):
+        raise ValueError(f"config.PREDICT_MODELS={config.PREDICT_MODELS!r}; expected 'all' or 'fold0'")
+    n_models = config.N_FOLDS if config.PREDICT_MODELS == "all" else 1
+    threads = config.PREDICT_THREADS or config.LGBM_NUM_THREADS
+    boosters = [lgb.Booster(model_file=art / MODEL_DIR / f"model_fold{k}.txt") for k in range(n_models)]
+    cols = trained_features(art / MODEL_DIR, boosters[0])
     parts = _parts(art / "features_test")
-    io_utils.require_columns(pq.ParquetFile(parts[0]).schema_arrow.names, cols, str(parts[0]))
+    on_disk = _feature_columns(parts[0])
+    if on_disk != cols:
+        raise ValueError(f"{parts[0]}: feature columns differ from the trained list; missing "
+                         f"{sorted(set(cols) - set(on_disk))}, extra {sorted(set(on_disk) - set(cols))}"
+                         + ("" if set(cols) != set(on_disk) else ", order differs"))
 
     def pred_tables() -> Iterator[pa.Table]:
         """Mean fold-model probability for one part at a time."""
         for p in parts:
             t = pq.read_table(p, columns=["s1_id", "cand_id", *cols])
             x = np.column_stack([t.column(c).to_numpy() for c in cols])
-            prob = np.mean([b.predict(x, num_threads=config.LGBM_NUM_THREADS) for b in boosters], axis=0)
+            prob = np.mean([b.predict(x, num_threads=threads) for b in boosters], axis=0)
             yield pa.table({"s1_id": t.column("s1_id"), "cand_id": t.column("cand_id"),
                             "prob": pa.array(prob.astype(np.float32))})
             del t
@@ -282,7 +316,8 @@ def run_predict(paths: Paths) -> None:
 
     _write_parquet(art / "pred_test.parquet", pred_tables())
     n_pairs = pq.ParquetFile(art / "pred_test.parquet").metadata.num_rows
-    logger.info("Wrote pred_test.parquet: %d pairs, mean of %d fold models", n_pairs, len(boosters))
+    logger.info("Wrote pred_test.parquet: %d pairs, mean of %d fold models (%s, %d threads)", n_pairs,
+                len(boosters), config.PREDICT_MODELS, threads)
 
 
 def run_stage(paths: Paths, split: str) -> None:

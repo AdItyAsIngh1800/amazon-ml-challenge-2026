@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import lightgbm as lgb
@@ -114,3 +115,43 @@ def test_predict_missing_feature_raises(trained: tuple[Paths, pd.DataFrame]) -> 
     pd.read_parquet(part).drop(columns=["sim_b"]).to_parquet(part, index=False)
     with pytest.raises(ValueError, match="sim_b"):
         model.run_stage(paths, "test")
+
+
+def test_train_saves_feature_list(trained: tuple[Paths, pd.DataFrame]) -> None:
+    """models/feature_list.json holds the exact trained feature columns in order."""
+    paths, _ = trained
+    saved = json.loads((paths.artifacts_dir / model.MODEL_DIR / model.FEATURE_LIST_FILE).read_text(encoding="utf-8"))
+    assert saved == ["sim_a", "sim_b", "noise"]
+
+
+def test_predict_extra_feature_raises(trained: tuple[Paths, pd.DataFrame]) -> None:
+    """Test features with a column the models never saw (e.g. v2 parts, v1 models) are refused."""
+    paths, _ = trained
+    folder = paths.artifacts_dir / "features_test"
+    _write_parts(folder, 5, 2, 1, seed=3, label=False)
+    part = folder / "part-00000.parquet"
+    pd.read_parquet(part).assign(unit_conflict=np.float32(0)).to_parquet(part, index=False)
+    with pytest.raises(ValueError, match="unit_conflict"):
+        model.run_stage(paths, "test")
+
+
+def test_predict_feature_list_mismatch_raises(trained: tuple[Paths, pd.DataFrame]) -> None:
+    """A feature_list.json that disagrees with the saved models is refused."""
+    paths, _ = trained
+    _write_parts(paths.artifacts_dir / "features_test", 5, 2, 1, seed=3, label=False)
+    (paths.artifacts_dir / model.MODEL_DIR / model.FEATURE_LIST_FILE).write_text('["sim_a"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="feature_list.json"):
+        model.run_stage(paths, "test")
+
+
+def test_predict_fold0_only(trained: tuple[Paths, pd.DataFrame], monkeypatch: pytest.MonkeyPatch) -> None:
+    """PREDICT_MODELS=fold0 predicts with fold 0's model alone; PREDICT_THREADS is accepted."""
+    paths, _ = trained
+    test = _write_parts(paths.artifacts_dir / "features_test", 50, 6, 2, seed=2, label=False)
+    monkeypatch.setattr(config, "PREDICT_MODELS", "fold0")
+    monkeypatch.setattr(config, "PREDICT_THREADS", 1)
+    model.run_stage(paths, "test")
+    pred = pd.read_parquet(paths.artifacts_dir / "pred_test.parquet")
+    b0 = lgb.Booster(model_file=paths.artifacts_dir / model.MODEL_DIR / "model_fold0.txt")
+    expected = np.asarray(b0.predict(test[["sim_a", "sim_b", "noise"]].to_numpy()))
+    np.testing.assert_allclose(pred["prob"].to_numpy(), expected, rtol=1e-5)
