@@ -451,12 +451,83 @@ Thresholds are therefore tuned only on full train, never on a sample.
 
 - **Decision variants:** full-train comparison in Section 4.5 (threshold + one-owner
   chosen; per-source equal; expected-F0.5 −0.0009, singletons 0.910).
-- **Common false positives (wrong merges):** TODO (from full-train OOF; describe patterns
-  only, no raw records).
-- **Common false negatives (missed matches):** 4.65% of true pairs are never scored
-  because blocking missed them (Section 3: cross-script names, empty addresses, the cap,
-  moderately similar pairs outranked by distractors). A breakdown of the remaining
-  decision/model misses: TODO.
+**Where F0.5 is lost** (`python -m src.error_report`, `artifacts/error_report/report.txt`;
+full-train OOF under `decision_config.json`, 1,103,410 S1, macro F0.5 0.9597, identical to
+decide). Each wrong pair falls in one bucket; "points lost" is the macro-F0.5 gain if that
+bucket alone were fixed.
+
+| Bucket | Meaning | Pairs | S1 | F0.5 points lost |
+|---|---|---|---|---|
+| B1 | Predicted match for a singleton S1 (false merge) | 3,011 | 2,740 | 0.0025 |
+| B2 | Wrong extra match on an S1 that has true matches | 34,180 | 32,973 | 0.0065 |
+| B4_threshold | True candidate rejected by t / t_empty | 127,976 | 112,147 | 0.0120 |
+| B4_one_owner | True candidate given to another S1 by the one-owner rule | 23,267 | 22,533 | 0.0021 |
+| **B4 total** | Missed true candidates | 151,243 | 132,376 | **0.0141** |
+| **B1 + B2** | Wrong matches | 37,191 | — | **0.0090** |
+
+Per country and per candidate source (F0.5 points lost; rows add up to the overall row):
+
+| Bucket | India | US | S2 | S3 |
+|---|---|---|---|---|
+| B1 | 0.0011 | 0.0014 | 0.0012 | 0.0013 |
+| B2 | 0.0029 | 0.0036 | 0.0032 | 0.0033 |
+| B4_threshold | 0.0042 | 0.0077 | 0.0059 | 0.0061 |
+| B4_one_owner | 0.0009 | 0.0013 | 0.0011 | 0.0011 |
+| B4 total | 0.0051 | 0.0090 | 0.0069 | 0.0071 |
+
+**Interpretation.** Missed matches cost more than wrong matches (0.0141 vs 0.0090). This
+is expected with a precision-heavy metric and a strict threshold (t = 0.69): the decision
+layer gives up recall on uncertain pairs to protect precision. The rest of the gap to 1.0
+(1 − 0.9597 = 0.040, of which the scored buckets explain ~0.023; bucket gains are not
+exactly additive) comes mostly from blocking misses: 4.65% of true pairs never become
+candidates (Section 3). The US loses more to rejected matches (B4 0.0090 vs 0.0051 for
+India), whereas India loses more to blocking (6.77% of its true pairs missed vs 3.23% in
+the US, largely cross-script names). S2 and S3 behave alike.
+
+**Common false positives (wrong merges, B1/B2).** Patterns from the report's random
+examples; names shortened and partly masked, no full records.
+
+- **Same building, different unit.** Near-identical names at the same street address or
+  complex with a different unit, flat or door number (e.g. "Seril\*\*\* Services" at
+  flat A402 vs "Seril\*\*\* Services LLP" at A407; "Physical T\*\*\* Clinic" at unit 5
+  vs "… Clinic Ltd" at no. 3A) are labelled as different businesses. Address similarity
+  is high and the name matches up to a legal form, so the model scores them 0.94–0.97.
+- **Cross-script name with one different word.** A Latin S1 name against an Indic-script
+  candidate at the same address where one word differs after transliteration (e.g.
+  "Shakti Gl\*\*\*" vs Devanagari "Sky Gl\*\*\*"; "Bombay Pr\*\*\*" vs Telugu "Bombay
+  Po\*\*\*"; "Green My C\*\*\*" vs Tamil "Green My T\*\*\*"). The shared words and the address
+  dominate the similarity.
+- **Same name, candidate address empty.** A singleton S1 and a candidate with the same
+  name up to punctuation, a typo or a legal form ("Moore P\*\*\* (Corp)", "Mcleod
+  D\*\*\* PC", "Mccalla & Th0\*\*\* LLC") but no candidate address: with nothing to
+  contradict the name, the model predicts a match; the ground truth treats it as a
+  namesake.
+- **Extra near-duplicate of a true match (B2).** On S1 with true matches, the extra match
+  is often another variant of the same name (e.g. "The Kalp\*\*\* Services Private
+  Limited" at a different door number, or an exact lowercase copy of the S1 name) that
+  looks as close as the labelled matches; some of these may be separate registrations of
+  the same business name, or label noise.
+
+**Common false negatives (missed matches).** 4.65% of true pairs are never scored because
+blocking missed them (Section 3: cross-script names, empty addresses, the cap, moderately
+similar pairs outranked by distractors). Among scored pairs (B4):
+
+- **Placeholder or unrelated name, identical address.** The true candidate's name is a
+  random-looking token (e.g. "Calo\*\*\*", "Lyra\*\*\*") while the address matches the
+  S1 almost exactly. Probabilities are 0.02–0.21: the model rightly will not merge on
+  address alone, since same-address distractors are common (first FP pattern).
+- **Short or generic name, empty candidate address, lost to one-owner.** Near-identical
+  names with no candidate address ("NP Great Fed\*\*\* Group" vs "… INC"; "Silver
+  Ha\*\*\* P.C." vs "Silver Ha\*\*\*"; an exact one-word name). Without an address
+  several S1 with that name compete for the candidate, and it goes to another S1 or scores
+  0.01–0.30.
+- **Legal-form and noise-word changes just below the threshold.** Same business with the
+  legal form dropped or changed and injected noise words ("Lucknow Ni\*\*\* Private
+  Limited" vs "… Limited Partners Partners"; "Mountain Ho\*\*\* Inc" vs "Mountain
+  Ho\*\*\*"; "Fresh Classic Al\*\*\* Inc" vs "…-lnc") at 0.45–0.55, below t = 0.69:
+  the cost of the strict threshold.
+- **Cross-script pairs that reach the candidates but score low.** E.g. "Future Me\*\*\*
+  LLP" vs its Telugu-script spelling at a partly matching address scores 0.32.
 
 ---
 
