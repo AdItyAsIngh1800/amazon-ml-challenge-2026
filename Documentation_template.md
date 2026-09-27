@@ -310,8 +310,8 @@ positive rate within 0.023 of its mean probability.
   calibration transfers. Drop-one-feature LOCO (69 runs): deltas −0.0003 to +0.0006, none
   reaches the +0.002 acceptance bar, so no feature was removed.
 - **Caveat:** the mini sample keeps all true matches plus *random* distractors, so hard
-  negatives are rare; these ~0.99 scores will not carry over to full data. Full-train LOCO:
-  **TODO**.
+  negatives are rare; these ~0.99 scores will not carry over to full data. Full-train LOCO was **not
+  run**: it needs a retrain per held-out country at full scale (Section 6).
 
 ### 4.5 Decision layer
 
@@ -336,7 +336,21 @@ test.
   0.99 on probabilities, because almost all pairs score near 0 (PR #20); the fixed grid
   closes that gap (PR #21, merged). The search sorts pairs once and
   sweeps the grid incrementally (O(n log n)), and unit tests check it against brute force.
-- **Calibration** (mini OOF): expected calibration error 0.0003 (PR #18).
+- **Calibration:** expected calibration error 0.0003 on the mini OOF (PR #18) and 0.0003
+  on the full-train OOF (55.2M pairs, `compare_run.log`):
+
+| Probability bin | Pairs | Mean prob | Positive rate |
+|---|---|---|---|
+| [0.0, 0.1) | 51,291,576 | 0.0005 | 0.0007 |
+| [0.1, 0.2) | 121,497 | 0.1434 | 0.1655 |
+| [0.2, 0.3) | 66,682 | 0.2464 | 0.2666 |
+| [0.3, 0.4) | 48,357 | 0.3478 | 0.3635 |
+| [0.4, 0.5) | 40,077 | 0.4489 | 0.4567 |
+| [0.5, 0.6) | 36,914 | 0.5498 | 0.5521 |
+| [0.6, 0.7) | 38,936 | 0.6510 | 0.6512 |
+| [0.7, 0.8) | 48,123 | 0.7526 | 0.7481 |
+| [0.8, 0.9) | 77,596 | 0.8557 | 0.8526 |
+| [0.9, 1.0] | 3,400,742 | 0.9958 | 0.9956 |
 
 Mini sample, model v0 OOF (rows A-decide-20260926-1739*, -205011, -205447; PR #18, #21):
 
@@ -347,8 +361,26 @@ Mini sample, model v0 OOF (rows A-decide-20260926-1739*, -205011, -205447; PR #1
 | expected_f05 | 0.9916 | 0.9916 (no grid) |
 
 On the same mini sample, the rule baseline (`rrf_score` only, no model) scores 0.9358 with
-the same decision layer. The final rule is chosen on full train with `--stage compare`:
-**TODO** (the submitted M2 uses `threshold` + one-owner, Section 5).
+the same decision layer. The final rule is chosen on full train with `--stage compare` (`decide_compare.tsv`,
+full-train OOF, 1,103,410 S1; runtime 180 s):
+
+| Variant | Params | Overall | Singleton | Non-singleton | India | US |
+|---|---|---|---|---|---|---|
+| **threshold + one-owner (chosen)** | t = 0.69, t_empty = 0.73 | **0.9597** | 0.9555 | 0.9600 | 0.9512 | 0.9654 |
+| per_source + one-owner | t_s2 = t_s3 = 0.69, t_empty = 0.73 | 0.9597 | 0.9555 | 0.9600 | 0.9512 | 0.9654 |
+| expected_f05 + one-owner | — | 0.9588 | 0.9099 | 0.9617 | 0.9505 | 0.9644 |
+| threshold | t = 0.705, t_empty = 0.75 | 0.9593 | 0.9566 | 0.9595 | 0.9506 | 0.9651 |
+| per_source | t_s2 = 0.69, t_s3 = 0.71, t_empty = 0.75 | 0.9593 | 0.9566 | 0.9595 | 0.9506 | 0.9651 |
+| expected_f05 | — | 0.9582 | 0.9024 | 0.9615 | 0.9497 | 0.9638 |
+
+**Chosen: `threshold` + one-owner (t = 0.69, t_empty = 0.73, F0.5 0.9597).** Per-source
+thresholds give no gain: with one-owner the search lands on t_s2 = t_s3, and without it
+t_s2 = 0.69 / t_s3 = 0.71 score the same as the single threshold. Expected-F0.5 is 0.0009
+lower overall even though the probabilities are very well calibrated (ECE 0.0003): it is
+slightly better on non-singletons (0.9617 vs 0.9600) but drops singletons to 0.910, most likely
+because a single candidate with moderate probability already makes a non-empty list the
+expected-F0.5 optimum, while `t_empty` is tuned directly on the all-or-nothing singleton
+score. One-owner adds +0.0004 (0.9597 vs 0.9593).
 
 ---
 
@@ -367,7 +399,10 @@ blocked train S1; blocking misses count as false negatives.
 | Non-singleton S1 | 1,041,786 | 0.9600 |
 | US | 661,816 | 0.9654 |
 | India | 441,594 | 0.9512 |
-| LOCO mean | — | TODO |
+| LOCO mean (**mini sample**, Section 4.4) | — | 0.9882 |
+
+Full-train LOCO was not run (it needs a retrain per held-out country); the mini-sample
+LOCO above uses random distractors and overstates the level, not just the drop.
 
 Without the one-owner rule the best F0.5 is 0.9593 (t = 0.705, t_empty = 0.75), so the
 rule adds +0.0004. On test, the same config gives 5,528,207 matches for 1,732,544 S1 and
@@ -378,7 +413,17 @@ rule adds +0.0004. On test, the same config gives 5,528,207 matches for 1,732,54
 | Submission | Description | Leaderboard F0.5 |
 |---|---|---|
 | M1 | Rule baseline: `rrf_score` + decision layer, no model (dev F0.5 0.888) | 0.677 |
-| M2 | LightGBM model + `threshold` + one-owner (this document) | **TODO** |
+| **M2 (final)** | LightGBM model + `threshold` + one-owner (this document) | **0.953** |
+
+M2 scores 0.953 against 0.9597 full-train OOF, a gap of 0.007. Likely reasons:
+
+- **Denser test:** 5.75 S2/S3 per S1 against 4.68 in train, so more distractors per S1
+  than the thresholds were tuned on.
+- **Unseen France:** 259,452 test S1 (15%) come from a country never seen in training or
+  threshold tuning.
+- **50% train fraction:** with only half of train S1 blocked, fewer S1 compete for each
+  S2/S3 ID in validation, so the one-owner rule and the thresholds were tuned under
+  weaker competition than on test, where every S1 is blocked.
 
 ### 5.3 Dev sample vs. full data
 
@@ -404,8 +449,8 @@ Thresholds are therefore tuned only on full train, never on a sample.
 
 ### 5.4 Error analysis
 
-- **Decision-variant comparison (full train, `decide_compare.tsv`):** TODO (threshold /
-  per_source / expected_f05 × one-owner on/off).
+- **Decision variants:** full-train comparison in Section 4.5 (threshold + one-owner
+  chosen; per-source equal; expected-F0.5 −0.0009, singletons 0.910).
 - **Common false positives (wrong merges):** TODO (from full-train OOF; describe patterns
   only, no raw records).
 - **Common false negatives (missed matches):** 4.65% of true pairs are never scored
@@ -419,7 +464,8 @@ Thresholds are therefore tuned only on full train, never on a sample.
 
 The pipeline runs end to end on full data on a 16 GB laptop (peak RSS 8.05 GB, README
 runtime table) and reaches full-train OOF F0.5 0.9597 (US 0.9654, India 0.9512,
-singletons 0.9555). Blocking is the main ceiling: 4.65% of true pairs are never scored.
+singletons 0.9555) and **0.953 on the leaderboard** (M1 rule baseline: 0.677). Blocking
+is the main ceiling: 4.65% of true pairs are never scored.
 
 **Limitations**
 
@@ -433,6 +479,9 @@ singletons 0.9555). Blocking is the main ceiling: 4.65% of true pairs are never 
   with only half of the competing S1 present: an S2/S3 ID can be claimed only by blocked
   S1, so conflicts between S1 are undercounted and its measured gain (+0.0004) may differ
   from its effect on test, where every S1 is blocked.
+- **No full-train LOCO.** Transfer to an unseen country (France) was measured only on
+  the mini sample (drop ≤ 0.005); a full-scale LOCO needs one retrain per held-out
+  country and was not run.
 - **Runtime.** Test blocking took 35,211 s (9.8 h, single worker) and predict 15,371 s
   (4.3 h, 5 fold models × 86.6M pairs); both dominate the end-to-end time.
 
@@ -483,8 +532,8 @@ python -m src.make_submission --team-name TEAM $D                               
 ```
 
 Each stage skips if its outputs exist (`--force` reruns it) and logs runtime and peak RSS.
-The decision method is set to the full-train winner of `--stage compare` (TODO; M2 uses
-`threshold` + one-owner). `write`
+The decision method is set to the full-train winner of `--stage compare` (`threshold` +
+one-owner). `write`
 runs `utils/validate_submission.py` and publishes the TSVs only on `PASS`. The README
 gives stage-by-stage commands, data layout, overrides and measured runtimes. Hardware: MacBook
 Air (Apple M4, 16 GB); every stage is designed for ≤ 10 GB peak RAM. Tests:
@@ -492,12 +541,44 @@ Air (Apple M4, 16 GB); every stage is designed for ≤ 10 GB peak RAM. Tests:
 
 ### B. Additional Results
 
-TODO charts:
-- Blocking recall vs. cap (union @20/30/50/80) per country, full train.
-- F0.5 vs. threshold t (and t_empty) on full-train OOF, per decision method.
-- Calibration (reliability) plot of full-train OOF probabilities.
-- Feature importance (gain) and group ablation, full train.
-- F0.5 by segment (singleton / non-singleton / country) and LOCO.
+Tables instead of charts; all full train (50% of S1), from `blocking_recall_train.tsv`,
+`compare_run.log` and `decide_compare.tsv`.
+
+**B.1 Blocking recall vs. cap** (pair recall; % S1 fully covered in brackets)
+
+| Cap | ALL | India | US |
+|---|---|---|---|
+| 20 | 0.9313 (82.7%) | 0.9098 (78.1%) | 0.9457 (85.8%) |
+| 30 | 0.9431 (85.3%) | 0.9213 (80.6%) | 0.9577 (88.5%) |
+| **50 (shipped)** | **0.9535 (87.7%)** | **0.9323 (83.0%)** | **0.9677 (90.9%)** |
+| 80 | 0.9602 (89.3%) | 0.9399 (84.7%) | 0.9738 (92.4%) |
+| uncapped (~97 per S1) | 0.9625 (89.9%) | 0.9427 (85.3%) | 0.9758 (92.9%) |
+
+**B.2 Calibration of OOF probabilities** (ECE 0.0003)
+
+| Probability bin | Pairs | Mean prob | Positive rate |
+|---|---|---|---|
+| [0.0, 0.1) | 51,291,576 | 0.0005 | 0.0007 |
+| [0.1, 0.2) | 121,497 | 0.1434 | 0.1655 |
+| [0.2, 0.3) | 66,682 | 0.2464 | 0.2666 |
+| [0.3, 0.4) | 48,357 | 0.3478 | 0.3635 |
+| [0.4, 0.5) | 40,077 | 0.4489 | 0.4567 |
+| [0.5, 0.6) | 36,914 | 0.5498 | 0.5521 |
+| [0.6, 0.7) | 38,936 | 0.6510 | 0.6512 |
+| [0.7, 0.8) | 48,123 | 0.7526 | 0.7481 |
+| [0.8, 0.9) | 77,596 | 0.8557 | 0.8526 |
+| [0.9, 1.0] | 3,400,742 | 0.9958 | 0.9956 |
+
+**B.3 Decision variants** (macro F0.5)
+
+| Variant | Params | Overall | Singleton | Non-singleton | India | US |
+|---|---|---|---|---|---|---|
+| **threshold + one-owner (chosen)** | t = 0.69, t_empty = 0.73 | **0.9597** | 0.9555 | 0.9600 | 0.9512 | 0.9654 |
+| per_source + one-owner | t_s2 = t_s3 = 0.69, t_empty = 0.73 | 0.9597 | 0.9555 | 0.9600 | 0.9512 | 0.9654 |
+| expected_f05 + one-owner | — | 0.9588 | 0.9099 | 0.9617 | 0.9505 | 0.9644 |
+| threshold | t = 0.705, t_empty = 0.75 | 0.9593 | 0.9566 | 0.9595 | 0.9506 | 0.9651 |
+| per_source | t_s2 = 0.69, t_s3 = 0.71, t_empty = 0.75 | 0.9593 | 0.9566 | 0.9595 | 0.9506 | 0.9651 |
+| expected_f05 | — | 0.9582 | 0.9024 | 0.9615 | 0.9497 | 0.9638 |
 
 ### C. Models and Libraries
 
