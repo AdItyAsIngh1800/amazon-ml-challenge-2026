@@ -1,8 +1,8 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** TODO  
-**Team Members:** TODO  
-**Submission Date:** TODO
+**Team Name:** Cypherz  
+**Team Members:** Aditya Singh , Nikhilesh Sharma , Samiksha Mukund Mote , Mishthi Mahajan  
+**Submission Date:** 27 September 2026
 
 > Draft status: every number below comes from `artifacts/eda/eda_report.txt` (full-data
 > EDA), `artifacts/experiments.tsv` or a merged/open PR description, and is labelled with
