@@ -60,6 +60,8 @@ INDEX_DTYPE = np.int32
 BLOCK_CHUNK_S1_ROWS: int = 10_000
 BLOCK_TOP_K: int | None = None  # overrides every pass's K; None = each pass's own
 MAX_CANDIDATES_PER_S1: int = 50
+BLOCK_WORKERS: int = 1  # top-K S1 chunks run in a fork process pool when > 1; output identical to 1
+BLOCK_S1_FRACTION: float = 1.0  # train only: block a stratified (country x singleton) share of S1
 RECALL_K_VALUES: tuple[int, ...] = (5, 10, 20, 50)
 PASS_C_MIN_NAME_COSINE: float = 0.2
 
@@ -76,9 +78,11 @@ TRAIN_MAX_ROWS: int = 10_000_000
 # model exists (run_pipeline --decide-score-column).
 DECIDE_SCORE_COLUMN: str = "prob"
 DECIDE_ONE_OWNER: bool = True  # EDA E3: 0 matched IDs shared between S1 lists
-# t / t_empty grid = this many quantiles of the decided score column, deduplicated
-# (adapts to rrf_score ~0.017-0.18 as well as to probabilities).
+# Every threshold grid (t, t_empty, t_s2/t_s3) = this many quantiles of the decided
+# score column (adapts to rrf_score ~0.017-0.18) UNION a fixed DECIDE_GRID_STEP grid
+# over (0, 1) (probabilities: near-0 bulk leaves no quantiles in 0.02-0.99, PR #20).
 DECIDE_GRID_QUANTILES: int = 200
+DECIDE_GRID_STEP: float = 0.005
 # Decision rule tuned by decide (run_pipeline --decide-method):
 #   "threshold"    one t for all candidates (+ t_empty gate)
 #   "per_source"   t_s2 / t_s3 by candidate ID prefix, coordinate descent from the global t

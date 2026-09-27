@@ -9,7 +9,8 @@ decide: <artifacts>/oof_train.parquet (s1_id, cand_id, <score col>, label) for A
         one-owner rule (each S2/S3 ID kept only for its highest-scoring S1),
         then per S1 keep score >= t, empty list if the S1's max score < t_empty.
         t and t_empty are grid-searched for macro F0.5 over ALL train S1 at once;
-        the grid is config.DECIDE_GRID_QUANTILES quantiles of the score column.
+        the grid is config.DECIDE_GRID_QUANTILES quantiles of the score column
+        plus a fixed config.DECIDE_GRID_STEP grid over (0, 1).
         config.DECIDE_METHOD swaps the rule: "per_source" (t_s2 / t_s3 by ID
         prefix, coordinate descent) or "expected_f05" (per-S1 expected-F0.5
         prefix of probability-sorted candidates). config.DECIDE_ONE_OWNER_AUTO
@@ -124,6 +125,10 @@ def load_split_ids(paths: Paths, split: str) -> SplitIds:
         paths: Run directories.
         split: ``"train"`` or ``"test"``.
 
+    On train, when blocking wrote ``blocking_s1_subset_train.parquet``
+    (``--block-s1-fraction`` < 1), only those S1 are kept: the others were
+    never blocked, so they are excluded from decide (logged).
+
     Returns:
         ``SplitIds`` (~1 GB for the full data: 12.5M IDs plus hash indexes).
 
@@ -133,8 +138,14 @@ def load_split_ids(paths: Paths, split: str) -> SplitIds:
     rec = io_utils.load_parquet(paths.artifacts_dir / f"records_{split}.parquet",
                                 columns=["entity_id", "source", "country"])
     is_s1 = (rec["source"] == "S1").to_numpy()
+    blocked = io_utils.load_blocked_s1(paths.artifacts_dir, split) if split == "train" else None
+    if blocked is not None:
+        n_all = int(is_s1.sum())
+        is_s1 = is_s1 & rec["entity_id"].isin(blocked).to_numpy()
+        logger.warning("decide/compare: using %d of %d train S1; %d unblocked S1 excluded (blocking S1 subset)",
+                       int(is_s1.sum()), n_all, n_all - int(is_s1.sum()))
     s1 = pd.Index(rec.loc[is_s1, "entity_id"])
-    cand = pd.Index(rec.loc[~is_s1, "entity_id"])
+    cand = pd.Index(rec.loc[(rec["source"] != "S1").to_numpy(), "entity_id"])
     k1, k2 = id_keys(pa.array(s1)), id_keys(pa.array(cand))
     o1, o2 = np.argsort(k1, kind="stable"), np.argsort(k2, kind="stable")
     if (np.diff(k1[o1]) == 0).any() or (np.diff(k2[o2]) == 0).any():
@@ -271,17 +282,21 @@ def per_s1_scores(pairs: Pairs, sel: NDArray[np.bool_], n_truth: NDArray[np.int6
     return evaluate.f05_from_counts(tp, n_pred, n_truth)
 
 
-def threshold_grid(scores: NDArray[np.float32], n_quantiles: int) -> tuple[float, ...]:
-    """Candidate thresholds: ``n_quantiles`` quantiles of the scores, deduplicated, ascending.
+def threshold_grid(scores: NDArray[np.float32], n_quantiles: int,
+                   step: float | None = None) -> tuple[float, ...]:
+    """Candidate thresholds: score quantiles UNION a fixed step grid, deduplicated, ascending.
 
     ``inverted_cdf`` quantiles are actual score values, so ``score >= t`` is exact
     in float32 and the grid follows whatever range the score column has
-    (rrf_score ~0.017-0.18 or probabilities). Memory: one float32 copy of
-    ``scores`` for the partition.
+    (rrf_score ~0.017-0.18). Probabilities pile up near 0, leaving no quantile
+    between ~0.02 and ~0.99, so the fixed grid step, 2*step, ..., 1 - step
+    (float32) covers that range. Memory: one float32 copy of ``scores`` for
+    the partition.
 
     Args:
         scores: All candidate scores being decided on.
         n_quantiles: Number of evenly spaced quantile levels in [0, 1].
+        step: Fixed grid spacing; None reads config.DECIDE_GRID_STEP, 0 disables.
 
     Returns:
         Sorted unique thresholds.
@@ -291,8 +306,10 @@ def threshold_grid(scores: NDArray[np.float32], n_quantiles: int) -> tuple[float
     """
     if len(scores) == 0:
         raise ValueError("threshold_grid needs at least one score")
+    step = config.DECIDE_GRID_STEP if step is None else step
     q = np.quantile(scores, np.linspace(0.0, 1.0, n_quantiles), method="inverted_cdf")
-    return tuple(float(v) for v in np.unique(q.astype(np.float32)))
+    fixed = np.arange(1, round(1 / step)) * step if step > 0 else np.empty(0)
+    return tuple(float(v) for v in np.unique(np.concatenate([q, fixed]).astype(np.float32)))
 
 
 @dataclass(frozen=True)
@@ -565,11 +582,11 @@ def apply_rule(pairs: Pairs, ids: SplitIds, keep: NDArray[np.bool_], rule: Mappi
 def truth_counts(data_dir: Path, ids: SplitIds) -> NDArray[np.int64]:
     """True matches per S1 code from the ground truth (includes matches blocking missed).
 
-    Raises:
-        ValueError: If the ground truth references an S1 not in records_train.
+    Ground-truth rows of S1 not in ``ids`` (excluded by a blocking S1 subset)
+    are ignored.
     """
     gt = io_utils.read_ground_truth_pairs(data_dir / "train" / "train_ground_truth.tsv")
-    gt = gt[gt["cand_id"] != ""]
+    gt = gt[(gt["cand_id"] != "") & gt["s1_id"].isin(ids.s1)]  # isin: S1 outside a blocking subset
     codes = encode(pa.array(gt["s1_id"]), ids.s1_keys, ids.s1_order, "ground-truth s1_id")
     return np.bincount(codes, minlength=len(ids.s1)).astype(np.int64)
 
@@ -585,10 +602,11 @@ def _load_train(paths: Paths) -> tuple[SplitIds, Pairs, NDArray[np.int64]]:
 
 
 def _grid(pairs: Pairs) -> tuple[float, ...]:
-    """Quantile threshold grid of the decided score column, logged."""
+    """Threshold grid (quantiles of the decided score column + fixed step grid), logged."""
     grid = threshold_grid(pairs.score, config.DECIDE_GRID_QUANTILES)
-    logger.info("Threshold grid: %d values from %d quantiles of %s, %.4g .. %.4g",
-                len(grid), config.DECIDE_GRID_QUANTILES, config.DECIDE_SCORE_COLUMN, grid[0], grid[-1])
+    logger.info("Threshold grid: %d values from %d quantiles of %s + step %g, %.4g .. %.4g",
+                len(grid), config.DECIDE_GRID_QUANTILES, config.DECIDE_SCORE_COLUMN, config.DECIDE_GRID_STEP,
+                grid[0], grid[-1])
     return grid
 
 

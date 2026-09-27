@@ -98,6 +98,7 @@ STAGES: dict[str, Stage] = {
 CONFIG_OVERRIDES: dict[str, str] = {
     "block_chunk_s1_rows": "BLOCK_CHUNK_S1_ROWS",
     "block_top_k": "BLOCK_TOP_K",
+    "block_workers": "BLOCK_WORKERS",
     "max_candidates_per_s1": "MAX_CANDIDATES_PER_S1",
     "feature_chunk_pairs": "FEATURE_CHUNK_PAIRS",
     "lgbm_num_threads": "LGBM_NUM_THREADS",
@@ -198,6 +199,9 @@ def build_parser() -> argparse.ArgumentParser:
     for flag, name in CONFIG_OVERRIDES.items():
         p.add_argument(f"--{flag.replace('_', '-')}", type=int, default=None,
                        help=f"override config.{name} (default {getattr(config, name)})")
+    p.add_argument("--block-s1-fraction", type=float, default=None,
+                   help="train only: block a stratified (country x singleton) fraction of S1; the rest get no "
+                        f"candidates and are excluded from training and decide (default {config.BLOCK_S1_FRACTION})")
     return p
 
 
@@ -207,7 +211,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     Args:
         argv: Arguments without the program name; ``sys.argv[1:]`` if None.
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.block_s1_fraction is not None and args.split != "train":
+        parser.error("--block-s1-fraction is train-only; the test split always blocks every S1")
     paths = config.get_paths(args.data_dir, args.artifacts_dir, args.out_dir)
     setup_logging(args.log_level, paths.log_dir)
     for flag, name in CONFIG_OVERRIDES.items():
@@ -215,6 +222,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         if value is not None:
             setattr(config, name, value)
         logger.info("config.%s = %s", name, getattr(config, name))
+    if args.block_s1_fraction is not None:
+        config.BLOCK_S1_FRACTION = args.block_s1_fraction
+    logger.info("config.BLOCK_S1_FRACTION = %s", config.BLOCK_S1_FRACTION)
     if args.decide_score_column is not None:
         config.DECIDE_SCORE_COLUMN = args.decide_score_column
     logger.info("config.DECIDE_SCORE_COLUMN = %s", config.DECIDE_SCORE_COLUMN)
